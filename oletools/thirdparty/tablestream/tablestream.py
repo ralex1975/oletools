@@ -19,7 +19,7 @@ License: BSD, see source code or documentation
 
 #=== LICENSE ==================================================================
 
-# tablestream is copyright (c) 2015-2016 Philippe Lagadec (http://www.decalage.info)
+# tablestream is copyright (c) 2015-2018 Philippe Lagadec (http://www.decalage.info)
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without modification,
@@ -54,8 +54,10 @@ from __future__ import print_function
 # 2016-07-31 v0.06 PL: - handle newline characters properly in each cell
 # 2016-08-28 v0.07 PL: - support for both Python 2.6+ and 3.x
 #                      - all cells are converted to unicode
+# 2018-09-22 v0.08 PL: - removed mention to oletools' thirdparty folder
+# 2019-03-27 v0.09 PL: - slight fix, TableStyleSlim inherits from TableStyle
 
-__version__ = '0.07'
+__version__ = '0.09'
 
 #------------------------------------------------------------------------------
 # TODO:
@@ -69,15 +71,6 @@ __version__ = '0.07'
 
 import textwrap
 import sys, os
-
-# add the thirdparty subfolder to sys.path (absolute+normalized path):
-_thismodule_dir = os.path.normpath(os.path.abspath(os.path.dirname(__file__)))
-# print('_thismodule_dir = %r' % _thismodule_dir)
-# assumption: this module is in a subfolder of thirdparty:
-_thirdparty_dir = os.path.normpath(os.path.join(_thismodule_dir, '..'))
-# print('_thirdparty_dir = %r' % _thirdparty_dir)
-if not _thirdparty_dir in sys.path:
-    sys.path.insert(0, _thirdparty_dir)
 
 import colorclass
 
@@ -182,7 +175,7 @@ class TableStyle(object):
     bottom_right = u'+'
 
 
-class TableStyleSlim(object):
+class TableStyleSlim(TableStyle):
     """
     Style for a TableStream.
     Example:

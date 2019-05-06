@@ -9,7 +9,7 @@ It is part of the [python-oletools](http://www.decalage.info/python/oletools) pa
 ## Usage
 
 ```text
-olemeta.py <file>
+olemeta <file>
 ```
 
 ### Example
@@ -30,14 +30,15 @@ python-oletools documentation
 - [[Install]]
 - [[Contribute]], Suggest Improvements or Report Issues
 - Tools:
-	- [[olebrowse]]
-	- [[oleid]]
-	- [[olemeta]]
-	- [[oletimes]]
-	- [[oledir]]
-	- [[olemap]]
-	- [[olevba]]
 	- [[mraptor]]
-	- [[pyxswf]]
+	- [[msodde]]
+	- [[olebrowse]]
+	- [[oledir]]
+	- [[oleid]]
+	- [[olemap]]
+	- [[olemeta]]
 	- [[oleobj]]
+	- [[oletimes]]
+	- [[olevba]]
+	- [[pyxswf]]
 	- [[rtfobj]]

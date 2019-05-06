@@ -25,7 +25,7 @@ http://www.decalage.info/python/oletools
 
 #=== LICENSE =================================================================
 
-# pyxswf is copyright (c) 2012-2016, Philippe Lagadec (http://www.decalage.info)
+# pyxswf is copyright (c) 2012-2019, Philippe Lagadec (http://www.decalage.info)
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without modification,
@@ -57,8 +57,9 @@ http://www.decalage.info/python/oletools
 # 2016-09-06 v0.50 PL: - updated to match the rtfobj API
 # 2016-10-25       PL: - fixed print for Python 3
 # 2016-11-01       PL: - replaced StringIO by BytesIO for Python 3
+# 2018-09-11 v0.54 PL: - olefile is now a dependency
 
-__version__ = '0.50'
+__version__ = '0.54'
 
 #------------------------------------------------------------------------------
 # TODO:
@@ -78,7 +79,7 @@ import optparse, sys, os
 from . import rtfobj
 from io import BytesIO
 from .thirdparty.xxxswf import xxxswf
-from .thirdparty import olefile
+import olefile
 
 
 #=== MAIN =================================================================

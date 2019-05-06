@@ -6,11 +6,19 @@ Code much influenced by olevba._extract_vba but much more object-oriented
 (possibly slightly excessively so)
 
 Currently quite narrowly focused on extracting VBA from ppt files, no slides or
-stuff, but built to be extended to parsing more/all of the file
+stuff, but built to be extended to parsing more/all of the file. For better
+"understanding" of ppt files, see module ppt_record_parser, which will probably
+replace this module some time soon.
 
 References:
 * https://msdn.microsoft.com/en-us/library/dd921564%28v=office.12%29.aspx
   and links there-in
+
+WARNING!
+Before thinking about understanding or even extending this module, please keep
+in mind that module ppt_record_parser has a better "understanding" of the ppt
+file structure and will replace this module some time soon!
+
 """
 
 # === LICENSE =================================================================
@@ -24,6 +32,7 @@ References:
 # - license
 # - make buffered stream from output of iterative_decompress
 # - maybe can merge the 2 decorators into 1? (with_opened_main_stream)
+# - REPLACE THIS MODULE with ppt_record_parser
 
 
 # CHANGELOG:
@@ -32,8 +41,9 @@ References:
 # 2016-09-13       PL: - fixed olefile import for Python 2+3
 #                      - fixed format strings for Python 2.6 (issue #75)
 # 2017-04-23 v0.51 PL: - fixed absolute imports and issue #101
+# 2018-09-11 v0.54 PL: - olefile is now a dependency
 
-__version__ = '0.51dev6'
+__version__ = '0.54'
 
 
 # --- IMPORTS ------------------------------------------------------------------
@@ -57,11 +67,41 @@ _parent_dir = os.path.normpath(os.path.join(_thismodule_dir, '..'))
 if not _parent_dir in sys.path:
     sys.path.insert(0, _parent_dir)
 
-from oletools.thirdparty.olefile import olefile
+import olefile
+
+
+# TODO: this is a temporary fix until all logging features are unified in oletools
+def get_logger(name, level=logging.CRITICAL+1):
+    """
+    Create a suitable logger object for this module.
+    The goal is not to change settings of the root logger, to avoid getting
+    other modules' logs on the screen.
+    If a logger exists with same name, reuse it. (Else it would have duplicate
+    handlers and messages would be doubled.)
+    The level is set to CRITICAL+1 by default, to avoid any logging.
+    """
+    # First, test if there is already a logger with the same name, else it
+    # will generate duplicate messages (due to duplicate handlers):
+    if name in logging.Logger.manager.loggerDict:
+        #NOTE: another less intrusive but more "hackish" solution would be to
+        # use getLogger then test if its effective level is not default.
+        logger = logging.getLogger(name)
+        # make sure level is OK:
+        logger.setLevel(level)
+        return logger
+    # get a new logger:
+    logger = logging.getLogger(name)
+    # only add a NullHandler for this logger, it is up to the application
+    # to configure its own logging:
+    logger.addHandler(logging.NullHandler())
+    logger.setLevel(level)
+    return logger
+
+
 
 
 # a global logger object used for debugging:
-log = olefile.get_logger('ppt')
+log = get_logger('ppt')
 
 
 def enable_logging():
@@ -1414,7 +1454,7 @@ class PptParser(object):
         .. seealso:: search_vba_storage
         """
 
-        logging.debug('looking for VBA info containers')
+        log.debug('looking for VBA info containers')
 
         pattern = VBAInfoContainer.generate_pattern(
                                 rec_len=VBAInfoContainer.RECORD_LENGTH) \
@@ -1466,7 +1506,7 @@ class PptParser(object):
         .. seealso:: :py:meth:`search_vba_info`
         """
 
-        logging.debug('looking for VBA storage objects')
+        log.debug('looking for VBA storage objects')
         for obj_type in (ExternalObjectStorageUncompressed,
                          ExternalObjectStorageCompressed):
             # re-position stream at start

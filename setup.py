@@ -22,6 +22,13 @@ to install this package.
 # 2016-07-29       PL: - use setuptools if available
 # 2016-09-05       PL: - added more entry points
 # 2017-01-18 v0.51 PL: - added package zipfile27 (issue #121)
+# 2017-10-18 v0.52 PL: - added msodde
+# 2018-03-19 v0.52.3      PL: - added install_requires, removed thirdparty.pyparsing
+# 2018-09-11 v0.54 PL: - olefile is now a dependency
+# 2018-09-15       PL: - easygui is now a dependency
+# 2018-09-22       PL: - colorclass is now a dependency
+# 2018-10-27       PL: - fixed issue #359 (bug when importing log_helper)
+# 2019-02-26       CH: - add optional dependency msoffcrypto for decryption
 
 #--- TODO ---------------------------------------------------------------------
 
@@ -41,16 +48,16 @@ import os, fnmatch
 #--- METADATA -----------------------------------------------------------------
 
 name         = "oletools"
-version      = '0.51dev7'
+version      = '0.54.1'
 desc         = "Python tools to analyze security characteristics of MS Office and OLE files (also called Structured Storage, Compound File Binary Format or Compound Document File Format), for Malware Analysis and Incident Response #DFIR"
 long_desc    = open('oletools/README.rst').read()
 author       = "Philippe Lagadec"
-author_email = "decalage at laposte dot net"
+author_email = "nospam@decalage.info"
 url          = "http://www.decalage.info/python/oletools"
 license      = "BSD"
 download_url = "https://github.com/decalage2/oletools/releases"
 
-# see https://pypi.python.org/pypi?%3Aaction=list_classifiers
+# see https://pypi.org/pypi?%3Aaction=list_classifiers
 classifiers=[
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -62,7 +69,12 @@ classifiers=[
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 2",
+    "Programming Language :: Python :: 2.7",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.4",
+    "Programming Language :: Python :: 3.5",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
     "Topic :: Security",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -71,17 +83,15 @@ classifiers=[
 
 packages=[
     "oletools",
+    "oletools.common",
+    "oletools.common.log_helper",
     'oletools.thirdparty',
-    'oletools.thirdparty.olefile',
-    'oletools.thirdparty.easygui',
     'oletools.thirdparty.xxxswf',
     'oletools.thirdparty.prettytable',
     'oletools.thirdparty.xglob',
     'oletools.thirdparty.DridexUrlDecoder',
-    'oletools.thirdparty.pyparsing',
-    'oletools.thirdparty.colorclass',
     'oletools.thirdparty.tablestream',
-    'oletools.thirdparty.zipfile27',
+    'oletools.thirdparty.oledump',
 ]
 ##setupdir = '.'
 ##package_dir={'': setupdir}
@@ -157,14 +167,7 @@ package_data={
         + rglob('oletools/doc', 'doc', '*.md')
         + rglob('oletools/doc', 'doc', '*.png'),
 
-    'oletools.thirdparty.olefile': [
-        'README.txt',
-        'LICENSE.txt',
-        ],
     'oletools.thirdparty.xglob': [
-        'LICENSE.txt',
-        ],
-    'oletools.thirdparty.easygui': [
         'LICENSE.txt',
         ],
     'oletools.thirdparty.xxxswf': [
@@ -174,15 +177,6 @@ package_data={
         'CHANGELOG', 'COPYING', 'README'
         ],
     'oletools.thirdparty.DridexUrlDecoder': [
-        'LICENSE.txt',
-        ],
-    'oletools.thirdparty.pyparsing': [
-        'LICENSE', 'README',
-        ],
-    'oletools.thirdparty.colorclass': [
-        'LICENSE.txt',
-        ],
-    'oletools.thirdparty.zipfile27': [
         'LICENSE.txt',
         ],
     # 'oletools.thirdparty.tablestream': [
@@ -271,6 +265,7 @@ entry_points = {
     'console_scripts': [
         'ezhexviewer=oletools.ezhexviewer:main',
         'mraptor=oletools.mraptor:main',
+        'mraptor3=oletools.mraptor3:main',
         'olebrowse=oletools.olebrowse:main',
         'oledir=oletools.oledir:main',
         'oleid=oletools.oleid:main',
@@ -278,9 +273,12 @@ entry_points = {
         'olemeta=oletools.olemeta:main',
         'oletimes=oletools.oletimes:main',
         'olevba=oletools.olevba:main',
+        'olevba3=oletools.olevba3:main',
         'pyxswf=oletools.pyxswf:main',
         'rtfobj=oletools.rtfobj:main',
         'oleobj=oletools.oleobj:main',
+        'msodde=oletools.msodde:main',
+        'olefile=olefile.olefile:main',
     ],
 }
 
@@ -312,7 +310,19 @@ def main():
         download_url=download_url,
 #        data_files=data_files,
         entry_points=entry_points,
+        test_suite="tests",
         # scripts=scripts,
+        install_requires=[
+            "pyparsing>=2.2.0",
+            "olefile>=0.46",
+            "easygui",
+            'colorclass',
+        ],
+        extras_require = {
+            # msoffcrypto-tools by nolze can be used to decrypt some office files
+            # TODO: make it a required dependency?
+            'decrypt': ['msoffcrypto-tool']
+        }
     )
 
 

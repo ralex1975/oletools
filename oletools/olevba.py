@@ -7,12 +7,14 @@ olevba is a script to parse OLE and OpenXML files such as MS Office documents
 and analyze malicious macros.
 
 Supported formats:
-- Word 97-2003 (.doc, .dot), Word 2007+ (.docm, .dotm)
-- Excel 97-2003 (.xls), Excel 2007+ (.xlsm, .xlsb)
-- PowerPoint 97-2003 (.ppt), PowerPoint 2007+ (.pptm, .ppsm)
-- Word 2003 XML (.xml)
-- Word/Excel Single File Web Page / MHTML (.mht)
-- Publisher (.pub)
+    - Word 97-2003 (.doc, .dot), Word 2007+ (.docm, .dotm)
+    - Excel 97-2003 (.xls), Excel 2007+ (.xlsm, .xlsb)
+    - PowerPoint 97-2003 (.ppt), PowerPoint 2007+ (.pptm, .ppsm)
+    - Word/PowerPoint 2007+ XML (aka Flat OPC)
+    - Word 2003 XML (.xml)
+    - Word/Excel Single File Web Page / MHTML (.mht)
+    - Publisher (.pub)
+    - raises an error if run with files encrypted using MS Crypto API RC4
 
 Author: Philippe Lagadec - http://www.decalage.info
 License: BSD, see source code or documentation
@@ -26,7 +28,7 @@ https://github.com/unixfreak0037/officeparser
 
 # === LICENSE ==================================================================
 
-# olevba is copyright (c) 2014-2017 Philippe Lagadec (http://www.decalage.info)
+# olevba is copyright (c) 2014-2019 Philippe Lagadec (http://www.decalage.info)
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without modification,
@@ -192,8 +194,30 @@ from __future__ import print_function
 #                      - added keywords for Mac-specific macros (issue #130)
 # 2017-03-08       PL: - fixed absolute imports
 # 2017-03-16       PL: - fixed issues #148 and #149 for option --reveal
+# 2017-05-19       PL: - added enable_logging to fix issue #154
+# 2017-05-31     c1fe: - PR #135 fixing issue #132 for some Mac files
+# 2017-06-08       PL: - fixed issue #122 Chr() with negative numbers
+# 2017-06-15       PL: - deobfuscation line by line to handle large files
+# 2017-07-11 v0.52 PL: - raise exception instead of sys.exit (issue #180)
+# 2017-11-08       VB: - PR #124 adding user form parsing (Vincent Brillault)
+# 2017-11-17       PL: - fixed a few issues with form parsing
+# 2017-11-20       PL: - fixed issue #219, do not close the file too early
+# 2017-11-24       PL: - added keywords to detect self-modifying macros and
+#                        attempts to disable macro security (issue #221)
+# 2018-03-19       PL: - removed pyparsing from the thirdparty subfolder
+# 2018-04-15 v0.53 PL: - added support for Word/PowerPoint 2007+ XML (FlatOPC)
+#                        (issue #283)
+# 2018-09-11 v0.54 PL: - olefile is now a dependency
+# 2018-10-08       PL: - replace backspace before printing to console (issue #358)
+# 2018-10-25       CH: - detect encryption and raise error if detected
+# 2018-12-03       PL: - uses tablestream (+colors) instead of prettytable
+# 2018-12-06       PL: - colorize the suspicious keywords found in VBA code
+# 2019-01-01       PL: - removed support for Python 2.6
+# 2019-03-18       PL: - added XLM/XLF macros detection for Excel OLE files
+# 2019-03-25       CH: - added decryption of password-protected files
+# 2019-04-09       PL: - decompress_stream accepts bytes (issue #422)
 
-__version__ = '0.51dev3'
+__version__ = '0.54.2'
 
 #------------------------------------------------------------------------------
 # TODO:
@@ -218,20 +242,20 @@ __version__ = '0.51dev3'
 # - extract_macros: use combined struct.unpack instead of many calls
 # - all except clauses should target specific exceptions
 
-#------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # REFERENCES:
 # - [MS-OVBA]: Microsoft Office VBA File Format Structure
 #   http://msdn.microsoft.com/en-us/library/office/cc313094%28v=office.12%29.aspx
 # - officeparser: https://github.com/unixfreak0037/officeparser
 
 
-#--- IMPORTS ------------------------------------------------------------------
+# --- IMPORTS ------------------------------------------------------------------
 
 import sys
 import os
 import logging
 import struct
-import cStringIO
+from io import BytesIO
 import math
 import zipfile
 import re
@@ -240,7 +264,7 @@ import binascii
 import base64
 import zlib
 import email  # for MHTML parsing
-import string # for printable
+import string  # for printable
 import json   # for json output mode (argument --json)
 
 # import lxml or ElementTree for XML parsing:
@@ -260,6 +284,13 @@ except ImportError:
                                + "see http://codespeak.net/lxml " \
                                + "or http://effbot.org/zone/element-index.htm")
 
+import colorclass
+
+# On Windows, colorclass needs to be enabled:
+if os.name == 'nt':
+    colorclass.Windows.enable(auto_colors=True)
+
+
 # IMPORTANT: it should be possible to run oletools directly as scripts
 # in any directory without installing them with pip or setup.py.
 # In that case, relative imports are NOT usable.
@@ -269,19 +300,22 @@ _thismodule_dir = os.path.normpath(os.path.abspath(os.path.dirname(__file__)))
 # print('_thismodule_dir = %r' % _thismodule_dir)
 _parent_dir = os.path.normpath(os.path.join(_thismodule_dir, '..'))
 # print('_parent_dir = %r' % _thirdparty_dir)
-if not _parent_dir in sys.path:
+if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-from oletools.thirdparty import olefile
-from oletools.thirdparty.prettytable import prettytable
+import olefile
+from oletools.thirdparty.tablestream import tablestream
 from oletools.thirdparty.xglob import xglob, PathNotFoundException
-from oletools.thirdparty.pyparsing.pyparsing import \
+from pyparsing import \
         CaselessKeyword, CaselessLiteral, Combine, Forward, Literal, \
         Optional, QuotedString,Regex, Suppress, Word, WordStart, \
         alphanums, alphas, hexnums,nums, opAssoc, srange, \
         infixNotation, ParserElement
 from oletools import ppt_parser
-
+from oletools import oleform
+from oletools import rtfobj
+from oletools import crypto
+from oletools.common import codepages
 
 # monkeypatch email to fix issue #32:
 # allow header lines without ":"
@@ -292,30 +326,77 @@ email.feedparser.headerRE = re.compile(r'^(From |[\041-\071\073-\176]{1,}:?|[\t 
 
 if sys.version_info[0] <= 2:
     # Python 2.x
-    if sys.version_info[1] <= 6:
-        # Python 2.6
-        # use is_zipfile backported from Python 2.7:
-        from thirdparty.zipfile27 import is_zipfile
-    else:
-        # Python 2.7
-        from zipfile import is_zipfile
+    PYTHON2 = True
+    # to use ord on bytes/bytearray items the same way in Python 2+3
+    # on Python 2, just use the normal ord() because items are bytes
+    byte_ord = ord
+    #: Default string encoding for the olevba API
+    DEFAULT_API_ENCODING = 'utf8'  # on Python 2: UTF-8 (bytes)
 else:
     # Python 3.x+
-    from zipfile import is_zipfile
+    PYTHON2 = False
+
+    # to use ord on bytes/bytearray items the same way in Python 2+3
+    # on Python 3, items are int, so just return the item
+    def byte_ord(x):
+        return x
     # xrange is now called range:
     xrange = range
+    # unichr does not exist anymore, only chr:
+    unichr = chr
+    # json2ascii also needs "unicode":
+    unicode = str
+    from functools import reduce
+    #: Default string encoding for the olevba API
+    DEFAULT_API_ENCODING = None  # on Python 3: None (unicode)
+    # Python 3.0 - 3.4 support:
+    # From https://gist.github.com/ynkdir/867347/c5e188a4886bc2dd71876c7e069a7b00b6c16c61
+    if sys.version_info < (3, 5):
+        import codecs
+        _backslashreplace_errors = codecs.lookup_error("backslashreplace")
+
+        def backslashreplace_errors(exc):
+            if isinstance(exc, UnicodeDecodeError):
+                u = "".join("\\x{0:02x}".format(c) for c in exc.object[exc.start:exc.end])
+                return u, exc.end
+            return _backslashreplace_errors(exc)
+
+        codecs.register_error("backslashreplace", backslashreplace_errors)
+
+
+def unicode2str(unicode_string):
+    """
+    convert a unicode string to a native str:
+        - on Python 3, it returns the same string
+        - on Python 2, the string is encoded with UTF-8 to a bytes str
+    :param unicode_string: unicode string to be converted
+    :return: the string converted to str
+    :rtype: str
+    """
+    if PYTHON2:
+        return unicode_string.encode('utf8', errors='replace')
+    else:
+        return unicode_string
+
+
+def bytes2str(bytes_string, encoding='utf8'):
+    """
+    convert a bytes string to a native str:
+        - on Python 2, it returns the same string (bytes=str)
+        - on Python 3, the string is decoded using the provided encoding
+          (UTF-8 by default) to a unicode str
+    :param bytes_string: bytes string to be converted
+    :param encoding: codec to be used for decoding
+    :return: the string converted to str
+    :rtype: str
+    """
+    if PYTHON2:
+        return bytes_string
+    else:
+        return bytes_string.decode('utf8', errors='replace')
+
 
 # === LOGGING =================================================================
-
-class NullHandler(logging.Handler):
-    """
-    Log Handler without output, to avoid printing messages if logging is not
-    configured by the main application.
-    Python 2.7 has logging.NullHandler, but this is necessary for 2.6:
-    see https://docs.python.org/2.6/library/logging.html#configuring-logging-for-a-library
-    """
-    def emit(self, record):
-        pass
 
 def get_logger(name, level=logging.CRITICAL+1):
     """
@@ -329,7 +410,7 @@ def get_logger(name, level=logging.CRITICAL+1):
     # First, test if there is already a logger with the same name, else it
     # will generate duplicate messages (due to duplicate handlers):
     if name in logging.Logger.manager.loggerDict:
-        #NOTE: another less intrusive but more "hackish" solution would be to
+        # NOTE: another less intrusive but more "hackish" solution would be to
         # use getLogger then test if its effective level is not default.
         logger = logging.getLogger(name)
         # make sure level is OK:
@@ -339,12 +420,25 @@ def get_logger(name, level=logging.CRITICAL+1):
     logger = logging.getLogger(name)
     # only add a NullHandler for this logger, it is up to the application
     # to configure its own logging:
-    logger.addHandler(NullHandler())
+    logger.addHandler(logging.NullHandler())
     logger.setLevel(level)
     return logger
 
 # a global logger object used for debugging:
 log = get_logger('olevba')
+
+
+def enable_logging():
+    """
+    Enable logging for this module (disabled by default).
+    This will set the module-specific logger level to NOTSET, which
+    means the main application controls the actual logging level.
+    """
+    log.setLevel(logging.NOTSET)
+    # Also enable logging in the ppt_parser module:
+    ppt_parser.enable_logging()
+    crypto.enable_logging()
+
 
 
 #=== EXCEPTIONS ==============================================================
@@ -432,6 +526,7 @@ RETURN_OPEN_ERROR     = 5
 RETURN_PARSE_ERROR    = 6
 RETURN_SEVERAL_ERRS   = 7
 RETURN_UNEXPECTED     = 8
+RETURN_ENCRYPTED      = 9
 
 # MAC codepages (from http://stackoverflow.com/questions/1592925/decoding-mac-os-text-in-python)
 MAC_CODEPAGES = {
@@ -456,6 +551,7 @@ MSG_OLEVBA_ISSUES = 'Please report this issue on %s' % URL_OLEVBA_ISSUES
 # Container types:
 TYPE_OLE = 'OLE'
 TYPE_OpenXML = 'OpenXML'
+TYPE_FlatOPC_XML = 'FlatOPC_XML'
 TYPE_Word2003_XML = 'Word2003_XML'
 TYPE_MHTML = 'MHTML'
 TYPE_TEXT = 'Text'
@@ -465,6 +561,7 @@ TYPE_PPT = 'PPT'
 TYPE2TAG = {
     TYPE_OLE: 'OLE:',
     TYPE_OpenXML: 'OpX:',
+    TYPE_FlatOPC_XML: 'FlX:',
     TYPE_Word2003_XML: 'XML:',
     TYPE_MHTML: 'MHT:',
     TYPE_TEXT: 'TXT:',
@@ -484,6 +581,18 @@ NS_W = '{http://schemas.microsoft.com/office/word/2003/wordml}'
 # the tag <w:binData w:name="editdata.mso"> contains the VBA macro code:
 TAG_BINDATA = NS_W + 'binData'
 ATTR_NAME = NS_W + 'name'
+
+# Namespaces and tags for Word/PowerPoint 2007+ XML parsing:
+# root: <pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">
+NS_XMLPACKAGE = '{http://schemas.microsoft.com/office/2006/xmlPackage}'
+TAG_PACKAGE = NS_XMLPACKAGE + 'package'
+# the tag <pkg:part> includes <pkg:binaryData> that contains the VBA macro code in Base64:
+# <pkg:part pkg:name="/word/vbaProject.bin" pkg:contentType="application/vnd.ms-office.vbaProject"><pkg:binaryData>
+TAG_PKGPART = NS_XMLPACKAGE + 'part'
+ATTR_PKG_NAME = NS_XMLPACKAGE + 'name'
+ATTR_PKG_CONTENTTYPE = NS_XMLPACKAGE + 'contentType'
+CTYPE_VBAPROJECT = "application/vnd.ms-office.vbaProject"
+TAG_PKGBINDATA = NS_XMLPACKAGE + 'binaryData'
 
 # Keywords to detect auto-executable macros
 AUTOEXEC_KEYWORDS = {
@@ -505,7 +614,8 @@ AUTOEXEC_KEYWORDS = {
 
     # MS Excel:
     'Runs when the Excel Workbook is opened':
-        ('Auto_Open', 'Workbook_Open', 'Workbook_Activate'),
+        ('Auto_Open', 'Workbook_Open', 'Workbook_Activate', 'Auto_Ope'),
+        # TODO: "Auto_Ope" is temporarily here because of a bug in plugin_biff, which misses the last byte in "Auto_Open"...
     'Runs when the Excel Workbook is closed':
         ('Auto_Close', 'Workbook_Close'),
 
@@ -541,9 +651,10 @@ SUSPICIOUS_KEYWORDS = {
         ('CreateTextFile', 'ADODB.Stream', 'WriteText', 'SaveToFile'),
     #CreateTextFile: http://msdn.microsoft.com/en-us/library/office/gg264617%28v=office.15%29.aspx
     #ADODB.Stream sample: http://pastebin.com/Z4TMyuq6
+    # ShellExecute: https://twitter.com/StanHacked/status/1075088449768693762
     'May run an executable file or a system command':
         ('Shell', 'vbNormal', 'vbNormalFocus', 'vbHide', 'vbMinimizedFocus', 'vbMaximizedFocus', 'vbNormalNoFocus',
-         'vbMinimizedNoFocus', 'WScript.Shell', 'Run', 'ShellExecute'),
+         'vbMinimizedNoFocus', 'WScript.Shell', 'Run', 'ShellExecute', 'ShellExecuteA', 'shell32'),
     # MacScript: see https://msdn.microsoft.com/en-us/library/office/gg264812.aspx
     'May run an executable file or a system command on a Mac':
         ('MacScript',),
@@ -561,6 +672,8 @@ SUSPICIOUS_KEYWORDS = {
          'invoke-command', 'scriptblock', 'Invoke-Expression', 'AuthorizationManager'),
     'May run an executable file or a system command using PowerShell':
         ('Start-Process',),
+    'May run an executable file or a system command using Excel 4 Macros (XLM/XLF)':
+        ('EXEC',),
     'May hide the application':
         ('Application.Visible', 'ShowWindow', 'SW_HIDE'),
     'May create a directory':
@@ -576,6 +689,8 @@ SUSPICIOUS_KEYWORDS = {
         ('New-Object',),
     'May run an application (if combined with CreateObject)':
         ('Shell.Application',),
+    'May run an Excel 4 Macro (aka XLM/XLF)':
+        ('ExecuteExcel4Macro',),
     'May enumerate application windows (if combined with Shell.Application object)':
         ('Windows', 'FindWindow'),
     'May run code from a DLL':
@@ -584,9 +699,11 @@ SUSPICIOUS_KEYWORDS = {
     'May run code from a library on a Mac':
     #TODO: regex to find declare+lib on same line - see mraptor
         ('libc.dylib', 'dylib'),
+    'May run code from a DLL using Excel 4 Macros (XLM/XLF)':
+        ('REGISTER',),
     'May inject code into another process':
         ('CreateThread', 'VirtualAlloc', # (issue #9) suggested by Davy Douhine - used by MSF payload
-        'VirtualAllocEx', 'RtlMoveMemory',
+        'VirtualAllocEx', 'RtlMoveMemory', 'WriteProcessMemory'
         ),
     'May run a shellcode in memory':
         ('EnumSystemLanguageGroupsW?', # Used by Hancitor in Oct 2016
@@ -645,6 +762,19 @@ SUSPICIOUS_KEYWORDS = {
     'May detect WinJail Sandbox':
     # ref: http://www.cplusplus.com/forum/windows/96874/
         ('Afx:400000:0',),
+    'May attempt to disable VBA macro security and Protected View':
+    # ref: http://blog.trendmicro.com/trendlabs-security-intelligence/qkg-filecoder-self-replicating-document-encrypting-ransomware/
+    # ref: https://thehackernews.com/2017/11/ms-office-macro-malware.html
+        ('AccessVBOM', 'VBAWarnings', 'ProtectedView', 'DisableAttachementsInPV', 'DisableInternetFilesInPV',
+         'DisableUnsafeLocationsInPV', 'blockcontentexecutionfrominternet'),
+    'May attempt to modify the VBA code (self-modification)':
+        ('VBProject', 'VBComponents', 'CodeModule', 'AddFromString'),
+}
+
+# Suspicious Keywords to be searched for directly as strings, without regex
+SUSPICIOUS_KEYWORDS_NOREGEX = {
+    'May use special characters such as backspace to obfuscate code when printed on the console':
+        ('\b',),
 }
 
 # Regular Expression for a URL:
@@ -705,7 +835,8 @@ re_dridex_string = re.compile(r'"[0-9A-Za-z]{20,}"')
 re_nothex_check = re.compile(r'[G-Zg-z]')
 
 # regex to extract printable strings (at least 5 chars) from VBA Forms:
-re_printable_string = re.compile(r'[\t\r\n\x20-\xFF]{5,}')
+# (must be bytes for Python 3)
+re_printable_string = re.compile(b'[\\t\\r\\n\\x20-\\xFF]{5,}')
 
 
 # === PARTIAL VBA GRAMMAR ====================================================
@@ -755,7 +886,7 @@ class VbaExpressionString(str):
 # NOTE: here Combine() is required to avoid spaces between elements
 # NOTE: here WordStart is necessary to avoid matching a number preceded by
 #       letters or underscore (e.g. "VBT1" or "ABC_34"), when using scanString
-decimal_literal = Combine(WordStart(vba_identifier_chars) + Optional('-') + Word(nums)
+decimal_literal = Combine(Optional('-') + WordStart(vba_identifier_chars) + Word(nums)
                           + Suppress(Optional(Word('%&^', exact=1))))
 decimal_literal.setParseAction(lambda t: int(t[0]))
 
@@ -846,10 +977,13 @@ vba_chr = Suppress(
 def vba_chr_tostr(t):
     try:
         i = t[0]
-        # normal, non-unicode character:
         if i>=0 and i<=255:
+            # normal, non-unicode character:
+            # TODO: check if it needs to be converted to bytes for Python 3
             return VbaExpressionString(chr(i))
         else:
+            # unicode character
+            # Note: this distinction is only needed for Python 2
             return VbaExpressionString(unichr(i).encode('utf-8', 'backslashreplace'))
     except ValueError:
         log.exception('ERROR: incorrect parameter value for chr(): %r' % i)
@@ -1116,8 +1250,8 @@ def decompress_stream(compressed_container):
     """
     Decompress a stream according to MS-OVBA section 2.4.1
 
-    compressed_container: string compressed according to the MS-OVBA 2.4.1.3.6 Compression algorithm
-    return the decompressed container as a string (bytes)
+    compressed_container: bytearray or bytes compressed according to the MS-OVBA 2.4.1.3.6 Compression algorithm
+    return the decompressed container as a bytes string
     """
     # 2.4.1.2 State Variables
 
@@ -1139,10 +1273,14 @@ def decompress_stream(compressed_container):
     # DecompressedChunkStart: The location of the first byte of the DecompressedChunk (section 2.4.1.1.3) within the
     #                         DecompressedBuffer (section 2.4.1.1.2).
 
-    decompressed_container = ''  # result
+    # Check the input is a bytearray, otherwise convert it (assuming it's bytes):
+    if not isinstance(compressed_container, bytearray):
+        compressed_container = bytearray(compressed_container)
+        # raise TypeError('decompress_stream requires a bytearray as input')
+    decompressed_container = bytearray()  # result
     compressed_current = 0
 
-    sig_byte = ord(compressed_container[compressed_current])
+    sig_byte = compressed_container[compressed_current]
     if sig_byte != 0x01:
         raise ValueError('invalid signature byte {0:02X}'.format(sig_byte))
 
@@ -1188,7 +1326,7 @@ def decompress_stream(compressed_container):
             # MS-OVBA 2.4.1.3.3 Decompressing a RawChunk
             # uncompressed chunk: read the next 4096 bytes as-is
             #TODO: check if there are at least 4096 bytes left
-            decompressed_container += compressed_container[compressed_current:compressed_current + 4096]
+            decompressed_container.extend([compressed_container[compressed_current:compressed_current + 4096]])
             compressed_current += 4096
         else:
             # MS-OVBA 2.4.1.3.2 Decompressing a CompressedChunk
@@ -1199,7 +1337,7 @@ def decompress_stream(compressed_container):
                 # log.debug('compressed_current = %d / compressed_end = %d' % (compressed_current, compressed_end))
                 # FlagByte: 8 bits indicating if the following 8 tokens are either literal (1 byte of plain text) or
                 # copy tokens (reference to a previous literal token)
-                flag_byte = ord(compressed_container[compressed_current])
+                flag_byte = compressed_container[compressed_current]
                 compressed_current += 1
                 for bit_index in xrange(0, 8):
                     # log.debug('bit_index=%d / compressed_current=%d / compressed_end=%d' % (bit_index, compressed_current, compressed_end))
@@ -1211,7 +1349,7 @@ def decompress_stream(compressed_container):
                     #log.debug('bit_index=%d: flag_bit=%d' % (bit_index, flag_bit))
                     if flag_bit == 0:  # LiteralToken
                         # copy one byte directly to output
-                        decompressed_container += compressed_container[compressed_current]
+                        decompressed_container.extend([compressed_container[compressed_current]])
                         compressed_current += 1
                     else:  # CopyToken
                         # MS-OVBA 2.4.1.3.19.2 Unpack CopyToken
@@ -1227,9 +1365,644 @@ def decompress_stream(compressed_container):
                         #log.debug('offset=%d length=%d' % (offset, length))
                         copy_source = len(decompressed_container) - offset
                         for index in xrange(copy_source, copy_source + length):
-                            decompressed_container += decompressed_container[index]
+                            decompressed_container.extend([decompressed_container[index]])
                         compressed_current += 2
-    return decompressed_container
+    return bytes(decompressed_container)
+
+
+class VBA_Module(object):
+    """
+    Class to parse a VBA module from an OLE file, and to store all the corresponding
+    metadata and VBA source code.
+    """
+
+    def __init__(self, project, dir_stream, module_index):
+        """
+        Parse a VBA Module record from the dir stream of a VBA project.
+        Reference: MS-OVBA 2.3.4.2.3.2 MODULE Record
+
+        :param VBA_Project project: VBA_Project, corresponding VBA project
+        :param olefile.OleStream dir_stream: olefile.OleStream, file object containing the module record
+        :param int module_index: int, index of the module in the VBA project list
+        """
+        #: reference to the VBA project for later use (VBA_Project)
+        self.project = project
+        #: VBA module name (unicode str)
+        self.name = None
+        #: VBA module name as a native str (utf8 bytes on py2, str on py3)
+        self.name_str = None
+        #: VBA module name, unicode copy (unicode str)
+        self._name_unicode = None
+        #: Stream name containing the VBA module (unicode str)
+        self.streamname = None
+        #: Stream name containing the VBA module as a native str (utf8 bytes on py2, str on py3)
+        self.streamname_str = None
+        self._streamname_unicode = None
+        self.docstring = None
+        self._docstring_unicode = None
+        self.textoffset = None
+        self.type = None
+        self.readonly = False
+        self.private = False
+        #: VBA source code in bytes format, using the original code page from the VBA project
+        self.code_raw = None
+        #: VBA source code in unicode format (unicode for Python2, str for Python 3)
+        self.code = None
+        #: VBA source code in native str format (str encoded with UTF-8 for Python 2, str for Python 3)
+        self.code_str = None
+        #: VBA module file name including an extension based on the module type such as bas, cls, frm (unicode str)
+        self.filename = None
+        #: VBA module file name in native str format (str)
+        self.filename_str = None
+        self.code_path = None
+        try:
+            # 2.3.4.2.3.2.1 MODULENAME Record
+            # Specifies a VBA identifier as the name of the containing MODULE Record
+            _id = struct.unpack("<H", dir_stream.read(2))[0]
+            project.check_value('MODULENAME_Id', 0x0019, _id)
+            size = struct.unpack("<L", dir_stream.read(4))[0]
+            modulename_bytes = dir_stream.read(size)
+            # Module name always stored as Unicode:
+            self.name = project.decode_bytes(modulename_bytes)
+            self.name_str = unicode2str(self.name)
+            # account for optional sections
+            # TODO: shouldn't this be a loop? (check MS-OVBA)
+            section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x0047:
+                # 2.3.4.2.3.2.2 MODULENAMEUNICODE Record
+                # Specifies a VBA identifier as the name of the containing MODULE Record (section 2.3.4.2.3.2).
+                # MUST contain the UTF-16 encoding of MODULENAME Record
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                self._name_unicode = dir_stream.read(size).decode('UTF-16LE', 'replace')
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x001A:
+                # 2.3.4.2.3.2.3 MODULESTREAMNAME Record
+                # Specifies the stream name of the ModuleStream (section 2.3.4.3) in the VBA Storage (section 2.3.4)
+                # corresponding to the containing MODULE Record
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                streamname_bytes = dir_stream.read(size)
+                # Store it as Unicode:
+                self.streamname = project.decode_bytes(streamname_bytes)
+                self.streamname_str = unicode2str(self.streamname)
+                reserved = struct.unpack("<H", dir_stream.read(2))[0]
+                project.check_value('MODULESTREAMNAME_Reserved', 0x0032, reserved)
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                self._streamname_unicode = dir_stream.read(size).decode('UTF-16LE', 'replace')
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x001C:
+                # 2.3.4.2.3.2.4 MODULEDOCSTRING Record
+                # Specifies the description for the containing MODULE Record
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                docstring_bytes = dir_stream.read(size)
+                self.docstring = project.decode_bytes(docstring_bytes)
+                reserved = struct.unpack("<H", dir_stream.read(2))[0]
+                project.check_value('MODULEDOCSTRING_Reserved', 0x0048, reserved)
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                self._docstring_unicode = dir_stream.read(size)
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x0031:
+                # 2.3.4.2.3.2.5 MODULEOFFSET Record
+                # Specifies the location of the source code within the ModuleStream (section 2.3.4.3)
+                # that corresponds to the containing MODULE Record
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULEOFFSET_Size', 0x0004, size)
+                self.textoffset = struct.unpack("<L", dir_stream.read(4))[0]
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x001E:
+                # 2.3.4.2.3.2.6 MODULEHELPCONTEXT Record
+                # Specifies the Help topic identifier for the containing MODULE Record
+                modulehelpcontext_size = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULEHELPCONTEXT_Size', 0x0004, modulehelpcontext_size)
+                # HelpContext (4 bytes): An unsigned integer that specifies the Help topic identifier
+                # in the Help file specified by PROJECTHELPFILEPATH Record
+                helpcontext = struct.unpack("<L", dir_stream.read(4))[0]
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x002C:
+                # 2.3.4.2.3.2.7 MODULECOOKIE Record
+                # Specifies ignored data.
+                size = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULECOOKIE_Size', 0x0002, size)
+                cookie = struct.unpack("<H", dir_stream.read(2))[0]
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x0021 or section_id == 0x0022:
+                # 2.3.4.2.3.2.8 MODULETYPE Record
+                # Specifies whether the containing MODULE Record (section 2.3.4.2.3.2) is a procedural module,
+                # document module, class module, or designer module.
+                # Id (2 bytes): An unsigned integer that specifies the identifier for this record.
+                # MUST be 0x0021 when the containing MODULE Record (section 2.3.4.2.3.2) is a procedural module.
+                # MUST be 0x0022 when the containing MODULE Record (section 2.3.4.2.3.2) is a document module,
+                # class module, or designer module.
+                self.type = section_id
+                reserved = struct.unpack("<L", dir_stream.read(4))[0]
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x0025:
+                # 2.3.4.2.3.2.9 MODULEREADONLY Record
+                # Specifies that the containing MODULE Record (section 2.3.4.2.3.2) is read-only.
+                self.readonly = True
+                reserved = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULEREADONLY_Reserved', 0x0000, reserved)
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x0028:
+                # 2.3.4.2.3.2.10 MODULEPRIVATE Record
+                # Specifies that the containing MODULE Record (section 2.3.4.2.3.2) is only usable from within
+                # the current VBA project.
+                self.private = True
+                reserved = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULEPRIVATE_Reserved', 0x0000, reserved)
+                section_id = struct.unpack("<H", dir_stream.read(2))[0]
+            if section_id == 0x002B:  # TERMINATOR
+                # Terminator (2 bytes): An unsigned integer that specifies the end of this record. MUST be 0x002B.
+                # Reserved (4 bytes): MUST be 0x00000000. MUST be ignored.
+                reserved = struct.unpack("<L", dir_stream.read(4))[0]
+                project.check_value('MODULE_Reserved', 0x0000, reserved)
+                section_id = None
+            if section_id != None:
+                log.warning('unknown or invalid module section id {0:04X}'.format(section_id))
+        
+            log.debug("Module Name = {0}".format(self.name_str))
+            # log.debug("Module Name Unicode = {0}".format(self._name_unicode))
+            log.debug("Stream Name = {0}".format(self.streamname_str))
+            # log.debug("Stream Name Unicode = {0}".format(self._streamname_unicode))
+            log.debug("TextOffset = {0}".format(self.textoffset))
+        
+            code_data = None
+            # let's try the different names we have, just in case some are missing:
+            try_names = (self.streamname, self._streamname_unicode, self.name, self._name_unicode)
+            for stream_name in try_names:
+                # TODO: if olefile._find were less private, could replace this
+                #        try-except with calls to it
+                if stream_name is not None:
+                    try:
+                        self.code_path = project.vba_root + u'VBA/' + stream_name
+                        log.debug('opening VBA code stream %s' % self.code_path)
+                        code_data = project.ole.openstream(self.code_path).read()
+                        break
+                    except IOError as ioe:
+                        log.debug('failed to open stream VBA/%r (%r), try other name'
+                                  % (stream_name, ioe))
+        
+            if code_data is None:
+                log.info("Could not open stream %d of %d ('VBA/' + one of %r)!"
+                         % (module_index, project.modules_count,
+                            '/'.join("'" + stream_name + "'"
+                                     for stream_name in try_names)))
+                if project.relaxed:
+                    return  # ... continue with next submodule
+                else:
+                    raise SubstreamOpenError('[BASE]', 'VBA/' + self.name)
+        
+            log.debug("length of code_data = {0}".format(len(code_data)))
+            log.debug("offset of code_data = {0}".format(self.textoffset))
+            code_data = code_data[self.textoffset:]
+            if len(code_data) > 0:
+                code_data = decompress_stream(bytearray(code_data))
+                # store the raw code encoded as bytes with the project's code page:
+                self.code_raw = code_data
+                # decode it to unicode:
+                self.code = project.decode_bytes(code_data)
+                # also store a native str version:
+                self.code_str = unicode2str(self.code)
+                # case-insensitive search in the code_modules dict to find the file extension:
+                filext = self.project.module_ext.get(self.name.lower(), 'vba')
+                self.filename = u'{0}.{1}'.format(self.name, filext)
+                self.filename_str = unicode2str(self.filename)
+                log.debug('extracted file {0}'.format(self.filename_str))
+            else:
+                log.warning("module stream {0} has code data length 0".format(self.streamname_str))
+        except (UnexpectedDataError, SubstreamOpenError):
+            raise
+        except Exception as exc:
+            log.info('Error parsing module {0} of {1}:'
+                     .format(module_index, project.modules_count),
+                     exc_info=True)
+            if not project.relaxed:
+                raise
+
+
+class VBA_Project(object):
+    """
+    Class to parse a VBA project from an OLE file, and to store all the corresponding
+    metadata and VBA modules.
+    """
+
+    def __init__(self, ole, vba_root, project_path, dir_path, relaxed=False):
+        """
+        Extract VBA macros from an OleFileIO object.
+
+        :param vba_root: path to the VBA root storage, containing the VBA storage and the PROJECT stream
+        :param project_path: path to the PROJECT stream
+        :param relaxed: If True, only create info/debug log entry if data is not as expected
+                        (e.g. opening substream fails); if False, raise an error in this case
+        """
+        self.ole = ole
+        self.vba_root = vba_root
+        self. project_path = project_path
+        self.dir_path = dir_path
+        self.relaxed = relaxed
+        #: VBA modules contained in the project (list of VBA_Module objects)
+        self.modules = []
+        #: file extension for each VBA module
+        self.module_ext = {}
+        log.debug('Parsing the dir stream from %r' % dir_path)
+        # read data from dir stream (compressed)
+        dir_compressed = ole.openstream(dir_path).read()
+        # decompress it:
+        dir_stream = BytesIO(decompress_stream(bytearray(dir_compressed)))
+        # store reference for later use:
+        self.dir_stream = dir_stream
+
+        # reference: MS-VBAL 2.3.4.2 dir Stream: Version Independent Project Information
+
+        # PROJECTSYSKIND Record
+        # Specifies the platform for which the VBA project is created.
+        projectsyskind_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTSYSKIND_Id', 0x0001, projectsyskind_id)
+        projectsyskind_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTSYSKIND_Size', 0x0004, projectsyskind_size)
+        self.syskind = struct.unpack("<L", dir_stream.read(4))[0]
+        SYSKIND_NAME = {
+            0x00: "16-bit Windows",
+            0x01: "32-bit Windows",
+            0x02: "Macintosh",
+            0x03: "64-bit Windows"
+        }
+        self.syskind_name = SYSKIND_NAME.get(self.syskind, 'Unknown')
+        log.debug("PROJECTSYSKIND_SysKind: %d - %s" % (self.syskind, self.syskind_name))
+        if self.syskind not in SYSKIND_NAME:
+            log.error("invalid PROJECTSYSKIND_SysKind {0:04X}".format(self.syskind))
+
+        # PROJECTLCID Record
+        # Specifies the VBA project's LCID.
+        projectlcid_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTLCID_Id', 0x0002, projectlcid_id)
+        projectlcid_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLCID_Size', 0x0004, projectlcid_size)
+        # Lcid (4 bytes): An unsigned integer that specifies the LCID value for the VBA project. MUST be 0x00000409.
+        self.lcid = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLCID_Lcid', 0x409, self.lcid)
+
+        # PROJECTLCIDINVOKE Record
+        # Specifies an LCID value used for Invoke calls on an Automation server as specified in [MS-OAUT] section 3.1.4.4.
+        projectlcidinvoke_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTLCIDINVOKE_Id', 0x0014, projectlcidinvoke_id)
+        projectlcidinvoke_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLCIDINVOKE_Size', 0x0004, projectlcidinvoke_size)
+        # LcidInvoke (4 bytes): An unsigned integer that specifies the LCID value used for Invoke calls. MUST be 0x00000409.
+        self.lcidinvoke = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLCIDINVOKE_LcidInvoke', 0x409, self.lcidinvoke)
+
+        # PROJECTCODEPAGE Record
+        # Specifies the VBA project's code page.
+        projectcodepage_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTCODEPAGE_Id', 0x0003, projectcodepage_id)
+        projectcodepage_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTCODEPAGE_Size', 0x0002, projectcodepage_size)
+        self.codepage = struct.unpack("<H", dir_stream.read(2))[0]
+        self.codepage_name = codepages.get_codepage_name(self.codepage)
+        log.debug('Project Code Page: %r - %s' % (self.codepage, self.codepage_name))
+        self.codec = codepages.codepage2codec(self.codepage)
+        log.debug('Python codec corresponding to code page %d: %s' % (self.codepage, self.codec))
+
+
+        # PROJECTNAME Record
+        # Specifies a unique VBA identifier as the name of the VBA project.
+        projectname_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTNAME_Id', 0x0004, projectname_id)
+        sizeof_projectname = struct.unpack("<L", dir_stream.read(4))[0]
+        log.debug('Project name size: %d bytes' % sizeof_projectname)
+        if sizeof_projectname < 1 or sizeof_projectname > 128:
+            # TODO: raise an actual error? What is MS Office's behaviour?
+            log.error("PROJECTNAME_SizeOfProjectName value not in range [1-128]: {0}".format(sizeof_projectname))
+        projectname_bytes = dir_stream.read(sizeof_projectname)
+        self.projectname = self.decode_bytes(projectname_bytes)
+
+
+        # PROJECTDOCSTRING Record
+        # Specifies the description for the VBA project.
+        projectdocstring_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTDOCSTRING_Id', 0x0005, projectdocstring_id)
+        projectdocstring_sizeof_docstring = struct.unpack("<L", dir_stream.read(4))[0]
+        if projectdocstring_sizeof_docstring > 2000:
+            log.error(
+                "PROJECTDOCSTRING_SizeOfDocString value not in range: {0}".format(projectdocstring_sizeof_docstring))
+        # DocString (variable): An array of SizeOfDocString bytes that specifies the description for the VBA project.
+        # MUST contain MBCS characters encoded using the code page specified in PROJECTCODEPAGE (section 2.3.4.2.1.4).
+        # MUST NOT contain null characters.
+        docstring_bytes = dir_stream.read(projectdocstring_sizeof_docstring)
+        self.docstring = self.decode_bytes(docstring_bytes)
+        projectdocstring_reserved = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTDOCSTRING_Reserved', 0x0040, projectdocstring_reserved)
+        projectdocstring_sizeof_docstring_unicode = struct.unpack("<L", dir_stream.read(4))[0]
+        if projectdocstring_sizeof_docstring_unicode % 2 != 0:
+            log.error("PROJECTDOCSTRING_SizeOfDocStringUnicode is not even")
+        # DocStringUnicode (variable): An array of SizeOfDocStringUnicode bytes that specifies the description for the
+        # VBA project. MUST contain UTF-16 characters. MUST NOT contain null characters.
+        # MUST contain the UTF-16 encoding of DocString.
+        docstring_unicode_bytes = dir_stream.read(projectdocstring_sizeof_docstring_unicode)
+        self.docstring_unicode = docstring_unicode_bytes.decode('utf16', errors='replace')
+
+        # PROJECTHELPFILEPATH Record - MS-OVBA 2.3.4.2.1.7
+        projecthelpfilepath_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTHELPFILEPATH_Id', 0x0006, projecthelpfilepath_id)
+        projecthelpfilepath_sizeof_helpfile1 = struct.unpack("<L", dir_stream.read(4))[0]
+        if projecthelpfilepath_sizeof_helpfile1 > 260:
+            log.error(
+                "PROJECTHELPFILEPATH_SizeOfHelpFile1 value not in range: {0}".format(projecthelpfilepath_sizeof_helpfile1))
+        projecthelpfilepath_helpfile1 = dir_stream.read(projecthelpfilepath_sizeof_helpfile1)
+        projecthelpfilepath_reserved = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTHELPFILEPATH_Reserved', 0x003D, projecthelpfilepath_reserved)
+        projecthelpfilepath_sizeof_helpfile2 = struct.unpack("<L", dir_stream.read(4))[0]
+        if projecthelpfilepath_sizeof_helpfile2 != projecthelpfilepath_sizeof_helpfile1:
+            log.error("PROJECTHELPFILEPATH_SizeOfHelpFile1 does not equal PROJECTHELPFILEPATH_SizeOfHelpFile2")
+        projecthelpfilepath_helpfile2 = dir_stream.read(projecthelpfilepath_sizeof_helpfile2)
+        if projecthelpfilepath_helpfile2 != projecthelpfilepath_helpfile1:
+            log.error("PROJECTHELPFILEPATH_HelpFile1 does not equal PROJECTHELPFILEPATH_HelpFile2")
+
+        # PROJECTHELPCONTEXT Record
+        projecthelpcontext_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTHELPCONTEXT_Id', 0x0007, projecthelpcontext_id)
+        projecthelpcontext_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTHELPCONTEXT_Size', 0x0004, projecthelpcontext_size)
+        projecthelpcontext_helpcontext = struct.unpack("<L", dir_stream.read(4))[0]
+        unused = projecthelpcontext_helpcontext
+
+        # PROJECTLIBFLAGS Record
+        projectlibflags_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTLIBFLAGS_Id', 0x0008, projectlibflags_id)
+        projectlibflags_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLIBFLAGS_Size', 0x0004, projectlibflags_size)
+        projectlibflags_projectlibflags = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTLIBFLAGS_ProjectLibFlags', 0x0000, projectlibflags_projectlibflags)
+
+        # PROJECTVERSION Record
+        projectversion_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTVERSION_Id', 0x0009, projectversion_id)
+        projectversion_reserved = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTVERSION_Reserved', 0x0004, projectversion_reserved)
+        projectversion_versionmajor = struct.unpack("<L", dir_stream.read(4))[0]
+        projectversion_versionminor = struct.unpack("<H", dir_stream.read(2))[0]
+        unused = projectversion_versionmajor
+        unused = projectversion_versionminor
+
+        # PROJECTCONSTANTS Record
+        projectconstants_id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTCONSTANTS_Id', 0x000C, projectconstants_id)
+        projectconstants_sizeof_constants = struct.unpack("<L", dir_stream.read(4))[0]
+        if projectconstants_sizeof_constants > 1015:
+            log.error(
+                "PROJECTCONSTANTS_SizeOfConstants value not in range: {0}".format(projectconstants_sizeof_constants))
+        projectconstants_constants = dir_stream.read(projectconstants_sizeof_constants)
+        projectconstants_reserved = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTCONSTANTS_Reserved', 0x003C, projectconstants_reserved)
+        projectconstants_sizeof_constants_unicode = struct.unpack("<L", dir_stream.read(4))[0]
+        if projectconstants_sizeof_constants_unicode % 2 != 0:
+            log.error("PROJECTCONSTANTS_SizeOfConstantsUnicode is not even")
+        projectconstants_constants_unicode = dir_stream.read(projectconstants_sizeof_constants_unicode)
+        unused = projectconstants_constants
+        unused = projectconstants_constants_unicode
+
+        # array of REFERENCE records
+        # Specifies a reference to an Automation type library or VBA project.
+        check = None
+        while True:
+            check = struct.unpack("<H", dir_stream.read(2))[0]
+            log.debug("reference type = {0:04X}".format(check))
+            if check == 0x000F:
+                break
+
+            if check == 0x0016:
+                # REFERENCENAME
+                # Specifies the name of a referenced VBA project or Automation type library.
+                reference_id = check
+                reference_sizeof_name = struct.unpack("<L", dir_stream.read(4))[0]
+                reference_name = dir_stream.read(reference_sizeof_name)
+                log.debug('REFERENCE name: %s' % unicode2str(self.decode_bytes(reference_name)))
+                reference_reserved = struct.unpack("<H", dir_stream.read(2))[0]
+                # According to [MS-OVBA] 2.3.4.2.2.2 REFERENCENAME Record:
+                # "Reserved (2 bytes): MUST be 0x003E. MUST be ignored."
+                # So let's ignore it, otherwise it crashes on some files (issue #132)
+                # PR #135 by @c1fe:
+                # contrary to the specification I think that the unicode name
+                # is optional. if reference_reserved is not 0x003E I think it
+                # is actually the start of another REFERENCE record
+                # at least when projectsyskind_syskind == 0x02 (Macintosh)
+                if reference_reserved == 0x003E:
+                    #if reference_reserved not in (0x003E, 0x000D):
+                    #    raise UnexpectedDataError(dir_path, 'REFERENCE_Reserved',
+                    #                              0x0003E, reference_reserved)
+                    reference_sizeof_name_unicode = struct.unpack("<L", dir_stream.read(4))[0]
+                    reference_name_unicode = dir_stream.read(reference_sizeof_name_unicode)
+                    unused = reference_id
+                    unused = reference_name
+                    unused = reference_name_unicode
+                    continue
+                else:
+                    check = reference_reserved
+                    log.debug("reference type = {0:04X}".format(check))
+
+            if check == 0x0033:
+                # REFERENCEORIGINAL (followed by REFERENCECONTROL)
+                # Specifies the identifier of the Automation type library the containing REFERENCECONTROL's
+                # (section 2.3.4.2.2.3) twiddled type library was generated from.
+                referenceoriginal_id = check
+                referenceoriginal_sizeof_libidoriginal = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceoriginal_libidoriginal = dir_stream.read(referenceoriginal_sizeof_libidoriginal)
+                log.debug('REFERENCE original lib id: %s' % unicode2str(self.decode_bytes(referenceoriginal_libidoriginal)))
+                unused = referenceoriginal_id
+                unused = referenceoriginal_libidoriginal
+                continue
+
+            if check == 0x002F:
+                # REFERENCECONTROL
+                # Specifies a reference to a twiddled type library and its extended type library.
+                referencecontrol_id = check
+                referencecontrol_sizetwiddled = struct.unpack("<L", dir_stream.read(4))[0]  # ignore
+                referencecontrol_sizeof_libidtwiddled = struct.unpack("<L", dir_stream.read(4))[0]
+                referencecontrol_libidtwiddled = dir_stream.read(referencecontrol_sizeof_libidtwiddled)
+                log.debug('REFERENCE control twiddled lib id: %s' % unicode2str(self.decode_bytes(referencecontrol_libidtwiddled)))
+                referencecontrol_reserved1 = struct.unpack("<L", dir_stream.read(4))[0]  # ignore
+                self.check_value('REFERENCECONTROL_Reserved1', 0x0000, referencecontrol_reserved1)
+                referencecontrol_reserved2 = struct.unpack("<H", dir_stream.read(2))[0]  # ignore
+                self.check_value('REFERENCECONTROL_Reserved2', 0x0000, referencecontrol_reserved2)
+                unused = referencecontrol_id
+                unused = referencecontrol_sizetwiddled
+                unused = referencecontrol_libidtwiddled
+                # optional field
+                check2 = struct.unpack("<H", dir_stream.read(2))[0]
+                if check2 == 0x0016:
+                    referencecontrol_namerecordextended_id = check
+                    referencecontrol_namerecordextended_sizeof_name = struct.unpack("<L", dir_stream.read(4))[0]
+                    referencecontrol_namerecordextended_name = dir_stream.read(
+                        referencecontrol_namerecordextended_sizeof_name)
+                    log.debug('REFERENCE control name record extended: %s' % unicode2str(
+                        self.decode_bytes(referencecontrol_namerecordextended_name)))
+                    referencecontrol_namerecordextended_reserved = struct.unpack("<H", dir_stream.read(2))[0]
+                    if referencecontrol_namerecordextended_reserved == 0x003E:
+                        referencecontrol_namerecordextended_sizeof_name_unicode = struct.unpack("<L", dir_stream.read(4))[0]
+                        referencecontrol_namerecordextended_name_unicode = dir_stream.read(
+                            referencecontrol_namerecordextended_sizeof_name_unicode)
+                        referencecontrol_reserved3 = struct.unpack("<H", dir_stream.read(2))[0]
+                        unused = referencecontrol_namerecordextended_id
+                        unused = referencecontrol_namerecordextended_name
+                        unused = referencecontrol_namerecordextended_name_unicode
+                    else:
+                        referencecontrol_reserved3 = referencecontrol_namerecordextended_reserved
+                else:
+                    referencecontrol_reserved3 = check2
+
+                self.check_value('REFERENCECONTROL_Reserved3', 0x0030, referencecontrol_reserved3)
+                referencecontrol_sizeextended = struct.unpack("<L", dir_stream.read(4))[0]
+                referencecontrol_sizeof_libidextended = struct.unpack("<L", dir_stream.read(4))[0]
+                referencecontrol_libidextended = dir_stream.read(referencecontrol_sizeof_libidextended)
+                referencecontrol_reserved4 = struct.unpack("<L", dir_stream.read(4))[0]
+                referencecontrol_reserved5 = struct.unpack("<H", dir_stream.read(2))[0]
+                referencecontrol_originaltypelib = dir_stream.read(16)
+                referencecontrol_cookie = struct.unpack("<L", dir_stream.read(4))[0]
+                unused = referencecontrol_sizeextended
+                unused = referencecontrol_libidextended
+                unused = referencecontrol_reserved4
+                unused = referencecontrol_reserved5
+                unused = referencecontrol_originaltypelib
+                unused = referencecontrol_cookie
+                continue
+
+            if check == 0x000D:
+                # REFERENCEREGISTERED
+                # Specifies a reference to an Automation type library.
+                referenceregistered_id = check
+                referenceregistered_size = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceregistered_sizeof_libid = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceregistered_libid = dir_stream.read(referenceregistered_sizeof_libid)
+                log.debug('REFERENCE registered lib id: %s' % unicode2str(self.decode_bytes(referenceregistered_libid)))
+                referenceregistered_reserved1 = struct.unpack("<L", dir_stream.read(4))[0]
+                self.check_value('REFERENCEREGISTERED_Reserved1', 0x0000, referenceregistered_reserved1)
+                referenceregistered_reserved2 = struct.unpack("<H", dir_stream.read(2))[0]
+                self.check_value('REFERENCEREGISTERED_Reserved2', 0x0000, referenceregistered_reserved2)
+                unused = referenceregistered_id
+                unused = referenceregistered_size
+                unused = referenceregistered_libid
+                continue
+
+            if check == 0x000E:
+                # REFERENCEPROJECT
+                # Specifies a reference to an external VBA project.
+                referenceproject_id = check
+                referenceproject_size = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceproject_sizeof_libidabsolute = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceproject_libidabsolute = dir_stream.read(referenceproject_sizeof_libidabsolute)
+                log.debug('REFERENCE project lib id absolute: %s' % unicode2str(self.decode_bytes(referenceproject_libidabsolute)))
+                referenceproject_sizeof_libidrelative = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceproject_libidrelative = dir_stream.read(referenceproject_sizeof_libidrelative)
+                log.debug('REFERENCE project lib id relative: %s' % unicode2str(self.decode_bytes(referenceproject_libidrelative)))
+                referenceproject_majorversion = struct.unpack("<L", dir_stream.read(4))[0]
+                referenceproject_minorversion = struct.unpack("<H", dir_stream.read(2))[0]
+                unused = referenceproject_id
+                unused = referenceproject_size
+                unused = referenceproject_libidabsolute
+                unused = referenceproject_libidrelative
+                unused = referenceproject_majorversion
+                unused = referenceproject_minorversion
+                continue
+
+            log.error('invalid or unknown check Id {0:04X}'.format(check))
+            # raise an exception instead of stopping abruptly (issue #180)
+            raise UnexpectedDataError(dir_path, 'reference type', (0x0F, 0x16, 0x33, 0x2F, 0x0D, 0x0E), check)
+            #sys.exit(0)
+
+    def check_value(self, name, expected, value):
+        if expected != value:
+            if self.relaxed:
+                log.error("invalid value for {0} expected {1:04X} got {2:04X}"
+                          .format(name, expected, value))
+            else:
+                raise UnexpectedDataError(self.dir_path, name, expected, value)
+
+    def parse_project_stream(self):
+        """
+        Parse the PROJECT stream from the VBA project
+        :return:
+        """
+        # Open the PROJECT stream:
+        # reference: [MS-OVBA] 2.3.1 PROJECT Stream
+        project_stream = self.ole.openstream(self.project_path)
+
+        # sample content of the PROJECT stream:
+
+        ##    ID="{5312AC8A-349D-4950-BDD0-49BE3C4DD0F0}"
+        ##    Document=ThisDocument/&H00000000
+        ##    Module=NewMacros
+        ##    Name="Project"
+        ##    HelpContextID="0"
+        ##    VersionCompatible32="393222000"
+        ##    CMG="F1F301E705E705E705E705"
+        ##    DPB="8F8D7FE3831F2020202020"
+        ##    GC="2D2FDD81E51EE61EE6E1"
+        ##
+        ##    [Host Extender Info]
+        ##    &H00000001={3832D640-CF90-11CF-8E43-00A0C911005A};VBE;&H00000000
+        ##    &H00000002={000209F2-0000-0000-C000-000000000046};Word8.0;&H00000000
+        ##
+        ##    [Workspace]
+        ##    ThisDocument=22, 29, 339, 477, Z
+        ##    NewMacros=-4, 42, 832, 510, C
+
+        self.module_ext = {}
+
+        for line in project_stream:
+            line = self.decode_bytes(line)
+            log.debug('PROJECT: %r' % line)
+            line = line.strip()
+            if '=' in line:
+                # split line at the 1st equal sign:
+                name, value = line.split('=', 1)
+                # looking for code modules
+                # add the code module as a key in the dictionary
+                # the value will be the extension needed later
+                # The value is converted to lowercase, to allow case-insensitive matching (issue #3)
+                value = value.lower()
+                if name == 'Document':
+                    # split value at the 1st slash, keep 1st part:
+                    value = value.split('/', 1)[0]
+                    self.module_ext[value] = CLASS_EXTENSION
+                elif name == 'Module':
+                    self.module_ext[value] = MODULE_EXTENSION
+                elif name == 'Class':
+                    self.module_ext[value] = CLASS_EXTENSION
+                elif name == 'BaseClass':
+                    self.module_ext[value] = FORM_EXTENSION
+
+    def parse_modules(self):
+        dir_stream = self.dir_stream
+        # projectmodules_id has already been read by the previous loop = 0x000F
+        # projectmodules_id = check  #struct.unpack("<H", dir_stream.read(2))[0]
+        # self.check_value('PROJECTMODULES_Id', 0x000F, projectmodules_id)
+        projectmodules_size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTMODULES_Size', 0x0002, projectmodules_size)
+        self.modules_count = struct.unpack("<H", dir_stream.read(2))[0]
+        _id = struct.unpack("<H", dir_stream.read(2))[0]
+        self.check_value('PROJECTMODULES_ProjectCookieRecord_Id', 0x0013, _id)
+        size = struct.unpack("<L", dir_stream.read(4))[0]
+        self.check_value('PROJECTMODULES_ProjectCookieRecord_Size', 0x0002, size)
+        projectcookierecord_cookie = struct.unpack("<H", dir_stream.read(2))[0]
+        unused = projectcookierecord_cookie
+
+        log.debug("parsing {0} modules".format(self.modules_count))
+        for module_index in xrange(0, self.modules_count):
+            module = VBA_Module(self, self.dir_stream, module_index=module_index)
+            self.modules.append(module)
+            yield (module.code_path, module.filename_str, module.code_str)
+        _ = unused   # make pylint happy: now variable "unused" is being used ;-)
+        return
+
+    def decode_bytes(self, bytes_string, errors='replace'):
+        """
+        Decode a bytes string to a unicode string, using the project code page
+        :param bytes_string: bytes, bytes string to be decoded
+        :param errors: str, mode to handle unicode conversion errors
+        :return: str/unicode, decoded string
+        """
+        return bytes_string.decode(self.codec, errors=errors)
+
 
 
 def _extract_vba(ole, vba_root, project_path, dir_path, relaxed=False):
@@ -1243,495 +2016,13 @@ def _extract_vba(ole, vba_root, project_path, dir_path, relaxed=False):
                     (e.g. opening substream fails); if False, raise an error in this case
     This is a generator, yielding (stream path, VBA filename, VBA source code) for each VBA code stream
     """
-    # Open the PROJECT stream:
-    project = ole.openstream(project_path)
     log.debug('relaxed is %s' % relaxed)
 
-    # sample content of the PROJECT stream:
+    project = VBA_Project(ole, vba_root, project_path, dir_path, relaxed=False)
+    project.parse_project_stream()
 
-    ##    ID="{5312AC8A-349D-4950-BDD0-49BE3C4DD0F0}"
-    ##    Document=ThisDocument/&H00000000
-    ##    Module=NewMacros
-    ##    Name="Project"
-    ##    HelpContextID="0"
-    ##    VersionCompatible32="393222000"
-    ##    CMG="F1F301E705E705E705E705"
-    ##    DPB="8F8D7FE3831F2020202020"
-    ##    GC="2D2FDD81E51EE61EE6E1"
-    ##
-    ##    [Host Extender Info]
-    ##    &H00000001={3832D640-CF90-11CF-8E43-00A0C911005A};VBE;&H00000000
-    ##    &H00000002={000209F2-0000-0000-C000-000000000046};Word8.0;&H00000000
-    ##
-    ##    [Workspace]
-    ##    ThisDocument=22, 29, 339, 477, Z
-    ##    NewMacros=-4, 42, 832, 510, C
-
-    code_modules = {}
-
-    for line in project:
-        line = line.strip()
-        if '=' in line:
-            # split line at the 1st equal sign:
-            name, value = line.split('=', 1)
-            # looking for code modules
-            # add the code module as a key in the dictionary
-            # the value will be the extension needed later
-            # The value is converted to lowercase, to allow case-insensitive matching (issue #3)
-            value = value.lower()
-            if name == 'Document':
-                # split value at the 1st slash, keep 1st part:
-                value = value.split('/', 1)[0]
-                code_modules[value] = CLASS_EXTENSION
-            elif name == 'Module':
-                code_modules[value] = MODULE_EXTENSION
-            elif name == 'Class':
-                code_modules[value] = CLASS_EXTENSION
-            elif name == 'BaseClass':
-                code_modules[value] = FORM_EXTENSION
-
-    # read data from dir stream (compressed)
-    dir_compressed = ole.openstream(dir_path).read()
-
-    def check_value(name, expected, value):
-        if expected != value:
-            if relaxed:
-                log.error("invalid value for {0} expected {1:04X} got {2:04X}"
-                          .format(name, expected, value))
-            else:
-                raise UnexpectedDataError(dir_path, name, expected, value)
-
-    dir_stream = cStringIO.StringIO(decompress_stream(dir_compressed))
-
-    # PROJECTSYSKIND Record
-    projectsyskind_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTSYSKIND_Id', 0x0001, projectsyskind_id)
-    projectsyskind_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTSYSKIND_Size', 0x0004, projectsyskind_size)
-    projectsyskind_syskind = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectsyskind_syskind == 0x00:
-        log.debug("16-bit Windows")
-    elif projectsyskind_syskind == 0x01:
-        log.debug("32-bit Windows")
-    elif projectsyskind_syskind == 0x02:
-        log.debug("Macintosh")
-    elif projectsyskind_syskind == 0x03:
-        log.debug("64-bit Windows")
-    else:
-        log.error("invalid PROJECTSYSKIND_SysKind {0:04X}".format(projectsyskind_syskind))
-
-    # PROJECTLCID Record
-    projectlcid_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTLCID_Id', 0x0002, projectlcid_id)
-    projectlcid_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLCID_Size', 0x0004, projectlcid_size)
-    projectlcid_lcid = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLCID_Lcid', 0x409, projectlcid_lcid)
-
-    # PROJECTLCIDINVOKE Record
-    projectlcidinvoke_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTLCIDINVOKE_Id', 0x0014, projectlcidinvoke_id)
-    projectlcidinvoke_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLCIDINVOKE_Size', 0x0004, projectlcidinvoke_size)
-    projectlcidinvoke_lcidinvoke = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLCIDINVOKE_LcidInvoke', 0x409, projectlcidinvoke_lcidinvoke)
-
-    # PROJECTCODEPAGE Record
-    projectcodepage_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTCODEPAGE_Id', 0x0003, projectcodepage_id)
-    projectcodepage_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTCODEPAGE_Size', 0x0002, projectcodepage_size)
-    projectcodepage_codepage = struct.unpack("<H", dir_stream.read(2))[0]
-
-    # PROJECTNAME Record
-    projectname_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTNAME_Id', 0x0004, projectname_id)
-    projectname_sizeof_projectname = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectname_sizeof_projectname < 1 or projectname_sizeof_projectname > 128:
-        log.error("PROJECTNAME_SizeOfProjectName value not in range: {0}".format(projectname_sizeof_projectname))
-    projectname_projectname = dir_stream.read(projectname_sizeof_projectname)
-    unused = projectname_projectname
-
-    # PROJECTDOCSTRING Record
-    projectdocstring_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTDOCSTRING_Id', 0x0005, projectdocstring_id)
-    projectdocstring_sizeof_docstring = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectdocstring_sizeof_docstring > 2000:
-        log.error(
-            "PROJECTDOCSTRING_SizeOfDocString value not in range: {0}".format(projectdocstring_sizeof_docstring))
-    projectdocstring_docstring = dir_stream.read(projectdocstring_sizeof_docstring)
-    projectdocstring_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTDOCSTRING_Reserved', 0x0040, projectdocstring_reserved)
-    projectdocstring_sizeof_docstring_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectdocstring_sizeof_docstring_unicode % 2 != 0:
-        log.error("PROJECTDOCSTRING_SizeOfDocStringUnicode is not even")
-    projectdocstring_docstring_unicode = dir_stream.read(projectdocstring_sizeof_docstring_unicode)
-    unused = projectdocstring_docstring
-    unused = projectdocstring_docstring_unicode
-
-    # PROJECTHELPFILEPATH Record - MS-OVBA 2.3.4.2.1.7
-    projecthelpfilepath_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTHELPFILEPATH_Id', 0x0006, projecthelpfilepath_id)
-    projecthelpfilepath_sizeof_helpfile1 = struct.unpack("<L", dir_stream.read(4))[0]
-    if projecthelpfilepath_sizeof_helpfile1 > 260:
-        log.error(
-            "PROJECTHELPFILEPATH_SizeOfHelpFile1 value not in range: {0}".format(projecthelpfilepath_sizeof_helpfile1))
-    projecthelpfilepath_helpfile1 = dir_stream.read(projecthelpfilepath_sizeof_helpfile1)
-    projecthelpfilepath_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTHELPFILEPATH_Reserved', 0x003D, projecthelpfilepath_reserved)
-    projecthelpfilepath_sizeof_helpfile2 = struct.unpack("<L", dir_stream.read(4))[0]
-    if projecthelpfilepath_sizeof_helpfile2 != projecthelpfilepath_sizeof_helpfile1:
-        log.error("PROJECTHELPFILEPATH_SizeOfHelpFile1 does not equal PROJECTHELPFILEPATH_SizeOfHelpFile2")
-    projecthelpfilepath_helpfile2 = dir_stream.read(projecthelpfilepath_sizeof_helpfile2)
-    if projecthelpfilepath_helpfile2 != projecthelpfilepath_helpfile1:
-        log.error("PROJECTHELPFILEPATH_HelpFile1 does not equal PROJECTHELPFILEPATH_HelpFile2")
-
-    # PROJECTHELPCONTEXT Record
-    projecthelpcontext_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTHELPCONTEXT_Id', 0x0007, projecthelpcontext_id)
-    projecthelpcontext_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTHELPCONTEXT_Size', 0x0004, projecthelpcontext_size)
-    projecthelpcontext_helpcontext = struct.unpack("<L", dir_stream.read(4))[0]
-    unused = projecthelpcontext_helpcontext
-
-    # PROJECTLIBFLAGS Record
-    projectlibflags_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTLIBFLAGS_Id', 0x0008, projectlibflags_id)
-    projectlibflags_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLIBFLAGS_Size', 0x0004, projectlibflags_size)
-    projectlibflags_projectlibflags = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTLIBFLAGS_ProjectLibFlags', 0x0000, projectlibflags_projectlibflags)
-
-    # PROJECTVERSION Record
-    projectversion_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTVERSION_Id', 0x0009, projectversion_id)
-    projectversion_reserved = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTVERSION_Reserved', 0x0004, projectversion_reserved)
-    projectversion_versionmajor = struct.unpack("<L", dir_stream.read(4))[0]
-    projectversion_versionminor = struct.unpack("<H", dir_stream.read(2))[0]
-    unused = projectversion_versionmajor
-    unused = projectversion_versionminor
-
-    # PROJECTCONSTANTS Record
-    projectconstants_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTCONSTANTS_Id', 0x000C, projectconstants_id)
-    projectconstants_sizeof_constants = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectconstants_sizeof_constants > 1015:
-        log.error(
-            "PROJECTCONSTANTS_SizeOfConstants value not in range: {0}".format(projectconstants_sizeof_constants))
-    projectconstants_constants = dir_stream.read(projectconstants_sizeof_constants)
-    projectconstants_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTCONSTANTS_Reserved', 0x003C, projectconstants_reserved)
-    projectconstants_sizeof_constants_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-    if projectconstants_sizeof_constants_unicode % 2 != 0:
-        log.error("PROJECTCONSTANTS_SizeOfConstantsUnicode is not even")
-    projectconstants_constants_unicode = dir_stream.read(projectconstants_sizeof_constants_unicode)
-    unused = projectconstants_constants
-    unused = projectconstants_constants_unicode
-
-    # array of REFERENCE records
-    check = None
-    while True:
-        check = struct.unpack("<H", dir_stream.read(2))[0]
-        log.debug("reference type = {0:04X}".format(check))
-        if check == 0x000F:
-            break
-
-        if check == 0x0016:
-            # REFERENCENAME
-            reference_id = check
-            reference_sizeof_name = struct.unpack("<L", dir_stream.read(4))[0]
-            reference_name = dir_stream.read(reference_sizeof_name)
-            reference_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-            # According to [MS-OVBA] 2.3.4.2.2.2 REFERENCENAME Record:
-            # "Reserved (2 bytes): MUST be 0x003E. MUST be ignored."
-            # So let's ignore it, otherwise it crashes on some files (issue #132)
-            # if reference_reserved not in (0x003E, 0x000D):
-            #     raise UnexpectedDataError(dir_path, 'REFERENCE_Reserved',
-            #                               (0x003E, 0x000D), reference_reserved)
-            reference_sizeof_name_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-            reference_name_unicode = dir_stream.read(reference_sizeof_name_unicode)
-            unused = reference_id
-            unused = reference_name
-            unused = reference_name_unicode
-            continue
-
-        if check == 0x0033:
-            # REFERENCEORIGINAL (followed by REFERENCECONTROL)
-            referenceoriginal_id = check
-            referenceoriginal_sizeof_libidoriginal = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceoriginal_libidoriginal = dir_stream.read(referenceoriginal_sizeof_libidoriginal)
-            unused = referenceoriginal_id
-            unused = referenceoriginal_libidoriginal
-            continue
-
-        if check == 0x002F:
-            # REFERENCECONTROL
-            referencecontrol_id = check
-            referencecontrol_sizetwiddled = struct.unpack("<L", dir_stream.read(4))[0]  # ignore
-            referencecontrol_sizeof_libidtwiddled = struct.unpack("<L", dir_stream.read(4))[0]
-            referencecontrol_libidtwiddled = dir_stream.read(referencecontrol_sizeof_libidtwiddled)
-            referencecontrol_reserved1 = struct.unpack("<L", dir_stream.read(4))[0]  # ignore
-            # MS-OVBA: "Reserved1 (4 bytes): MUST be 0x00000000. MUST be ignored."
-            # check_value('REFERENCECONTROL_Reserved1', 0x0000, referencecontrol_reserved1)
-            referencecontrol_reserved2 = struct.unpack("<H", dir_stream.read(2))[0]  # ignore
-            # MS-OVBA: "Reserved2 (2 bytes): MUST be 0x0000. MUST be ignored."
-            # check_value('REFERENCECONTROL_Reserved2', 0x0000, referencecontrol_reserved2)
-            unused = referencecontrol_id
-            unused = referencecontrol_sizetwiddled
-            unused = referencecontrol_libidtwiddled
-            # optional field
-            check2 = struct.unpack("<H", dir_stream.read(2))[0]
-            if check2 == 0x0016:
-                referencecontrol_namerecordextended_id = check
-                referencecontrol_namerecordextended_sizeof_name = struct.unpack("<L", dir_stream.read(4))[0]
-                referencecontrol_namerecordextended_name = dir_stream.read(
-                    referencecontrol_namerecordextended_sizeof_name)
-                referencecontrol_namerecordextended_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-                # check_value('REFERENCECONTROL_NameRecordExtended_Reserved', 0x003E,
-                #             referencecontrol_namerecordextended_reserved)
-                referencecontrol_namerecordextended_sizeof_name_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-                referencecontrol_namerecordextended_name_unicode = dir_stream.read(
-                    referencecontrol_namerecordextended_sizeof_name_unicode)
-                referencecontrol_reserved3 = struct.unpack("<H", dir_stream.read(2))[0]
-                unused = referencecontrol_namerecordextended_id
-                unused = referencecontrol_namerecordextended_name
-                unused = referencecontrol_namerecordextended_name_unicode
-            else:
-                referencecontrol_reserved3 = check2
-
-            # MS-OVBA: "Reserved3 (2 bytes): MUST be 0x0030. MUST be ignored."
-            # check_value('REFERENCECONTROL_Reserved3', 0x0030, referencecontrol_reserved3)
-            referencecontrol_sizeextended = struct.unpack("<L", dir_stream.read(4))[0]
-            referencecontrol_sizeof_libidextended = struct.unpack("<L", dir_stream.read(4))[0]
-            referencecontrol_libidextended = dir_stream.read(referencecontrol_sizeof_libidextended)
-            referencecontrol_reserved4 = struct.unpack("<L", dir_stream.read(4))[0]
-            referencecontrol_reserved5 = struct.unpack("<H", dir_stream.read(2))[0]
-            referencecontrol_originaltypelib = dir_stream.read(16)
-            referencecontrol_cookie = struct.unpack("<L", dir_stream.read(4))[0]
-            unused = referencecontrol_sizeextended
-            unused = referencecontrol_libidextended
-            unused = referencecontrol_reserved4
-            unused = referencecontrol_reserved5
-            unused = referencecontrol_originaltypelib
-            unused = referencecontrol_cookie
-            continue
-
-        if check == 0x000D:
-            # REFERENCEREGISTERED
-            referenceregistered_id = check
-            referenceregistered_size = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceregistered_sizeof_libid = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceregistered_libid = dir_stream.read(referenceregistered_sizeof_libid)
-            referenceregistered_reserved1 = struct.unpack("<L", dir_stream.read(4))[0]
-            # check_value('REFERENCEREGISTERED_Reserved1', 0x0000, referenceregistered_reserved1)
-            referenceregistered_reserved2 = struct.unpack("<H", dir_stream.read(2))[0]
-            # check_value('REFERENCEREGISTERED_Reserved2', 0x0000, referenceregistered_reserved2)
-            unused = referenceregistered_id
-            unused = referenceregistered_size
-            unused = referenceregistered_libid
-            continue
-
-        if check == 0x000E:
-            # REFERENCEPROJECT
-            referenceproject_id = check
-            referenceproject_size = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceproject_sizeof_libidabsolute = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceproject_libidabsolute = dir_stream.read(referenceproject_sizeof_libidabsolute)
-            referenceproject_sizeof_libidrelative = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceproject_libidrelative = dir_stream.read(referenceproject_sizeof_libidrelative)
-            referenceproject_majorversion = struct.unpack("<L", dir_stream.read(4))[0]
-            referenceproject_minorversion = struct.unpack("<H", dir_stream.read(2))[0]
-            unused = referenceproject_id
-            unused = referenceproject_size
-            unused = referenceproject_libidabsolute
-            unused = referenceproject_libidrelative
-            unused = referenceproject_majorversion
-            unused = referenceproject_minorversion
-            continue
-
-        log.error('invalid or unknown check Id {0:04X}'.format(check))
-        sys.exit(0)
-
-    projectmodules_id = check  #struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTMODULES_Id', 0x000F, projectmodules_id)
-    projectmodules_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTMODULES_Size', 0x0002, projectmodules_size)
-    projectmodules_count = struct.unpack("<H", dir_stream.read(2))[0]
-    projectmodules_projectcookierecord_id = struct.unpack("<H", dir_stream.read(2))[0]
-    check_value('PROJECTMODULES_ProjectCookieRecord_Id', 0x0013, projectmodules_projectcookierecord_id)
-    projectmodules_projectcookierecord_size = struct.unpack("<L", dir_stream.read(4))[0]
-    check_value('PROJECTMODULES_ProjectCookieRecord_Size', 0x0002, projectmodules_projectcookierecord_size)
-    projectmodules_projectcookierecord_cookie = struct.unpack("<H", dir_stream.read(2))[0]
-    unused = projectmodules_projectcookierecord_cookie
-
-    # short function to simplify unicode text output
-    uni_out = lambda unicode_text: unicode_text.encode('utf-8', 'replace')
-
-    log.debug("parsing {0} modules".format(projectmodules_count))
-    for projectmodule_index in xrange(0, projectmodules_count):
-        try:
-            modulename_id = struct.unpack("<H", dir_stream.read(2))[0]
-            check_value('MODULENAME_Id', 0x0019, modulename_id)
-            modulename_sizeof_modulename = struct.unpack("<L", dir_stream.read(4))[0]
-            modulename_modulename = dir_stream.read(modulename_sizeof_modulename)
-            # TODO: preset variables to avoid "referenced before assignment" errors
-            modulename_unicode_modulename_unicode = ''
-            # account for optional sections
-            section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x0047:
-                modulename_unicode_id = section_id
-                modulename_unicode_sizeof_modulename_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-                modulename_unicode_modulename_unicode = dir_stream.read(
-                    modulename_unicode_sizeof_modulename_unicode).decode('UTF-16LE', 'replace')
-                    # just guessing that this is the same encoding as used in OleFileIO
-                unused = modulename_unicode_id
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x001A:
-                modulestreamname_id = section_id
-                modulestreamname_sizeof_streamname = struct.unpack("<L", dir_stream.read(4))[0]
-                modulestreamname_streamname = dir_stream.read(modulestreamname_sizeof_streamname)
-                modulestreamname_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-                check_value('MODULESTREAMNAME_Reserved', 0x0032, modulestreamname_reserved)
-                modulestreamname_sizeof_streamname_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-                modulestreamname_streamname_unicode = dir_stream.read(
-                    modulestreamname_sizeof_streamname_unicode).decode('UTF-16LE', 'replace')
-                    # just guessing that this is the same encoding as used in OleFileIO
-                unused = modulestreamname_id
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x001C:
-                moduledocstring_id = section_id
-                check_value('MODULEDOCSTRING_Id', 0x001C, moduledocstring_id)
-                moduledocstring_sizeof_docstring = struct.unpack("<L", dir_stream.read(4))[0]
-                moduledocstring_docstring = dir_stream.read(moduledocstring_sizeof_docstring)
-                moduledocstring_reserved = struct.unpack("<H", dir_stream.read(2))[0]
-                check_value('MODULEDOCSTRING_Reserved', 0x0048, moduledocstring_reserved)
-                moduledocstring_sizeof_docstring_unicode = struct.unpack("<L", dir_stream.read(4))[0]
-                moduledocstring_docstring_unicode = dir_stream.read(moduledocstring_sizeof_docstring_unicode)
-                unused = moduledocstring_docstring
-                unused = moduledocstring_docstring_unicode
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x0031:
-                moduleoffset_id = section_id
-                check_value('MODULEOFFSET_Id', 0x0031, moduleoffset_id)
-                moduleoffset_size = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULEOFFSET_Size', 0x0004, moduleoffset_size)
-                moduleoffset_textoffset = struct.unpack("<L", dir_stream.read(4))[0]
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x001E:
-                modulehelpcontext_id = section_id
-                check_value('MODULEHELPCONTEXT_Id', 0x001E, modulehelpcontext_id)
-                modulehelpcontext_size = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULEHELPCONTEXT_Size', 0x0004, modulehelpcontext_size)
-                modulehelpcontext_helpcontext = struct.unpack("<L", dir_stream.read(4))[0]
-                unused = modulehelpcontext_helpcontext
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x002C:
-                modulecookie_id = section_id
-                check_value('MODULECOOKIE_Id', 0x002C, modulecookie_id)
-                modulecookie_size = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULECOOKIE_Size', 0x0002, modulecookie_size)
-                modulecookie_cookie = struct.unpack("<H", dir_stream.read(2))[0]
-                unused = modulecookie_cookie
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x0021 or section_id == 0x0022:
-                moduletype_id = section_id
-                moduletype_reserved = struct.unpack("<L", dir_stream.read(4))[0]
-                unused = moduletype_id
-                unused = moduletype_reserved
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x0025:
-                modulereadonly_id = section_id
-                check_value('MODULEREADONLY_Id', 0x0025, modulereadonly_id)
-                modulereadonly_reserved = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULEREADONLY_Reserved', 0x0000, modulereadonly_reserved)
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x0028:
-                moduleprivate_id = section_id
-                check_value('MODULEPRIVATE_Id', 0x0028, moduleprivate_id)
-                moduleprivate_reserved = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULEPRIVATE_Reserved', 0x0000, moduleprivate_reserved)
-                section_id = struct.unpack("<H", dir_stream.read(2))[0]
-            if section_id == 0x002B:  # TERMINATOR
-                module_reserved = struct.unpack("<L", dir_stream.read(4))[0]
-                check_value('MODULE_Reserved', 0x0000, module_reserved)
-                section_id = None
-            if section_id != None:
-                log.warning('unknown or invalid module section id {0:04X}'.format(section_id))
-
-            log.debug('Project CodePage = %d' % projectcodepage_codepage)
-            if projectcodepage_codepage in MAC_CODEPAGES:
-                vba_codec = MAC_CODEPAGES[projectcodepage_codepage]
-            else:
-                vba_codec = 'cp%d' % projectcodepage_codepage
-            log.debug("ModuleName = {0}".format(modulename_modulename))
-            log.debug("ModuleNameUnicode = {0}".format(uni_out(modulename_unicode_modulename_unicode)))
-            log.debug("StreamName = {0}".format(modulestreamname_streamname))
-            try:
-                streamname_unicode = modulestreamname_streamname.decode(vba_codec)
-            except UnicodeError as ue:
-                log.debug('failed to decode stream name {0!r} with codec {1}'
-                          .format(uni_out(streamname_unicode), vba_codec))
-                streamname_unicode = modulestreamname_streamname.decode(vba_codec, errors='replace')
-            log.debug("StreamName.decode('%s') = %s" % (vba_codec, uni_out(streamname_unicode)))
-            log.debug("StreamNameUnicode = {0}".format(uni_out(modulestreamname_streamname_unicode)))
-            log.debug("TextOffset = {0}".format(moduleoffset_textoffset))
-
-            code_data = None
-            try_names = streamname_unicode, \
-                        modulename_unicode_modulename_unicode, \
-                        modulestreamname_streamname_unicode
-            for stream_name in try_names:
-                # TODO: if olefile._find were less private, could replace this
-                #        try-except with calls to it
-                try:
-                    code_path = vba_root + u'VBA/' + stream_name
-                    log.debug('opening VBA code stream %s' % uni_out(code_path))
-                    code_data = ole.openstream(code_path).read()
-                    break
-                except IOError as ioe:
-                    log.debug('failed to open stream VBA/%r (%r), try other name'
-                              % (uni_out(stream_name), ioe))
-
-            if code_data is None:
-                log.info("Could not open stream %d of %d ('VBA/' + one of %r)!"
-                         % (projectmodule_index, projectmodules_count,
-                                 '/'.join("'" + uni_out(stream_name) + "'"
-                                          for stream_name in try_names)))
-                if relaxed:
-                    continue   # ... with next submodule
-                else:
-                    raise SubstreamOpenError('[BASE]', 'VBA/' +
-                                uni_out(modulename_unicode_modulename_unicode))
-
-            log.debug("length of code_data = {0}".format(len(code_data)))
-            log.debug("offset of code_data = {0}".format(moduleoffset_textoffset))
-            code_data = code_data[moduleoffset_textoffset:]
-            if len(code_data) > 0:
-                code_data = decompress_stream(code_data)
-                # case-insensitive search in the code_modules dict to find the file extension:
-                filext = code_modules.get(modulename_modulename.lower(), 'bin')
-                filename = '{0}.{1}'.format(modulename_modulename, filext)
-                #TODO: also yield the codepage so that callers can decode it properly
-                yield (code_path, filename, code_data)
-                # print '-'*79
-                # print filename
-                # print ''
-                # print code_data
-                # print ''
-                log.debug('extracted file {0}'.format(filename))
-            else:
-                log.warning("module stream {0} has code data length 0".format(modulestreamname_streamname))
-        except (UnexpectedDataError, SubstreamOpenError):
-            raise
-        except Exception as exc:
-            log.info('Error parsing module {0} of {1} in _extract_vba:'
-                     .format(projectmodule_index, projectmodules_count),
-                     exc_info=True)
-            if not relaxed:
-                raise
-    _ = unused   # make pylint happy: now variable "unused" is being used ;-)
-    return
+    for code_path, filename, code_data in project.parse_modules():
+        yield (code_path, filename, code_data)
 
 
 def vba_collapse_long_lines(vba_code):
@@ -1743,9 +2034,13 @@ def vba_collapse_long_lines(vba_code):
     :return: str, VBA module code with long lines collapsed
     """
     # TODO: use a regex instead, to allow whitespaces after the underscore?
-    vba_code = vba_code.replace(' _\r\n', ' ')
-    vba_code = vba_code.replace(' _\r', ' ')
-    vba_code = vba_code.replace(' _\n', ' ')
+    try:
+        vba_code = vba_code.replace(' _\r\n', ' ')
+        vba_code = vba_code.replace(' _\r', ' ')
+        vba_code = vba_code.replace(' _\n', ' ')
+    except:
+        log.exception('type(vba_code)=%s' % type(vba_code))
+        raise
     return vba_code
 
 
@@ -1794,7 +2089,7 @@ def detect_autoexec(vba_code, obfuscation=None):
         for keyword in keywords:
             #TODO: if keyword is already a compiled regex, use it as-is
             # search using regex to detect word boundaries:
-            match = re.search(r'(?i)\b' + keyword + r'\b', vba_code)
+            match = re.search(r'(?i)\b' + re.escape(keyword) + r'\b', vba_code)
             if match:
                 #if keyword.lower() in vba_code:
                 found_keyword = match.group()
@@ -1820,11 +2115,18 @@ def detect_suspicious(vba_code, obfuscation=None):
     for description, keywords in SUSPICIOUS_KEYWORDS.items():
         for keyword in keywords:
             # search using regex to detect word boundaries:
-            match = re.search(r'(?i)\b' + keyword + r'\b', vba_code)
+            # note: each keyword must be escaped if it contains special chars such as '\'
+            match = re.search(r'(?i)\b' + re.escape(keyword) + r'\b', vba_code)
             if match:
                 #if keyword.lower() in vba_code:
                 found_keyword = match.group()
                 results.append((found_keyword, description + obf_text))
+    for description, keywords in SUSPICIOUS_KEYWORDS_NOREGEX.items():
+        for keyword in keywords:
+            if keyword.lower() in vba_code:
+                # avoid reporting backspace chars out of plain VBA code:
+                if not(keyword=='\b' and obfuscation is not None):
+                    results.append((keyword, description + obf_text))
     return results
 
 
@@ -1862,7 +2164,7 @@ def detect_hex_strings(vba_code):
     for match in re_hex_string.finditer(vba_code):
         value = match.group()
         if value not in found:
-            decoded = binascii.unhexlify(value)
+            decoded = bytes2str(binascii.unhexlify(value))
             results.append((value, decoded))
             found.add(value)
     return results
@@ -1887,7 +2189,7 @@ def detect_base64_strings(vba_code):
         # only keep new values and not in the whitelist:
         if value not in found and value.lower() not in BASE64_WHITELIST:
             try:
-                decoded = base64.b64decode(value)
+                decoded = bytes2str(base64.b64decode(value))
                 results.append((value, decoded))
                 found.add(value)
             except (TypeError, ValueError) as exc:
@@ -1915,7 +2217,7 @@ def detect_dridex_strings(vba_code):
             continue
         if value not in found:
             try:
-                decoded = DridexUrlDecode(value)
+                decoded = bytes2str(DridexUrlDecode(value))
                 results.append((value, decoded))
                 found.add(value)
             except Exception as exc:
@@ -1939,28 +2241,31 @@ def detect_vba_strings(vba_code):
     #            we must expand tabs to have the same string as pyparsing.
     #            Otherwise, start and end offsets are incorrect.
     vba_code = vba_code.expandtabs()
-    for tokens, start, end in vba_expr_str.scanString(vba_code):
-        encoded = vba_code[start:end]
-        decoded = tokens[0]
-        if isinstance(decoded, VbaExpressionString):
-            # This is a VBA expression, not a simple string
-            # print 'VBA EXPRESSION: encoded=%r => decoded=%r' % (encoded, decoded)
-            # remove parentheses and quotes from original string:
-            # if encoded.startswith('(') and encoded.endswith(')'):
-            #     encoded = encoded[1:-1]
-            # if encoded.startswith('"') and encoded.endswith('"'):
-            #     encoded = encoded[1:-1]
-            # avoid duplicates and simple strings:
-            if encoded not in found and decoded != encoded:
-                results.append((encoded, decoded))
-                found.add(encoded)
-        # else:
-            # print 'VBA STRING: encoded=%r => decoded=%r' % (encoded, decoded)
+    # Split the VBA code line by line to avoid MemoryError on large scripts:
+    for vba_line in vba_code.splitlines():
+        for tokens, start, end in vba_expr_str.scanString(vba_line):
+            encoded = vba_line[start:end]
+            decoded = tokens[0]
+            if isinstance(decoded, VbaExpressionString):
+                # This is a VBA expression, not a simple string
+                # print 'VBA EXPRESSION: encoded=%r => decoded=%r' % (encoded, decoded)
+                # remove parentheses and quotes from original string:
+                # if encoded.startswith('(') and encoded.endswith(')'):
+                #     encoded = encoded[1:-1]
+                # if encoded.startswith('"') and encoded.endswith('"'):
+                #     encoded = encoded[1:-1]
+                # avoid duplicates and simple strings:
+                if encoded not in found and decoded != encoded:
+                    results.append((encoded, decoded))
+                    found.add(encoded)
+            # else:
+                # print 'VBA STRING: encoded=%r => decoded=%r' % (encoded, decoded)
     return results
 
 
 def json2ascii(json_obj, encoding='utf8', errors='replace'):
-    """ ensure there is no unicode in json and all strings are safe to decode
+    """
+    ensure there is no unicode in json and all strings are safe to decode
 
     works recursively, decodes and re-encodes every string to/from unicode
     to ensure there will be no trouble in loading the dumped json output
@@ -1970,20 +2275,32 @@ def json2ascii(json_obj, encoding='utf8', errors='replace'):
     elif isinstance(json_obj, (bool, int, float)):
         pass
     elif isinstance(json_obj, str):
-        # de-code and re-encode
-        dencoded = json_obj.decode(encoding, errors).encode(encoding, errors)
-        if dencoded != json_obj:
-            log.debug('json2ascii: replaced: {0} (len {1})'
-                     .format(json_obj, len(json_obj)))
-            log.debug('json2ascii:     with: {0} (len {1})'
-                     .format(dencoded, len(dencoded)))
-        return dencoded
-    elif isinstance(json_obj, unicode):
-        log.debug('json2ascii: encode unicode: {0}'
-                 .format(json_obj.encode(encoding, errors)))
+        if PYTHON2:
+            # de-code and re-encode
+            dencoded = json_obj.decode(encoding, errors).encode(encoding, errors)
+            if dencoded != json_obj:
+                log.debug('json2ascii: replaced: {0} (len {1})'
+                         .format(json_obj, len(json_obj)))
+                log.debug('json2ascii:     with: {0} (len {1})'
+                         .format(dencoded, len(dencoded)))
+            return dencoded
+        else:
+            # on Python 3, just keep Unicode strings as-is:
+            return json_obj
+    elif isinstance(json_obj, unicode) and PYTHON2:
+        # On Python 2, encode unicode to bytes:
+        json_obj_bytes = json_obj.encode(encoding, errors)
+        log.debug('json2ascii: encode unicode: {0}'.format(json_obj_bytes))
         # cannot put original into logger
         # print 'original: ' json_obj
-        return json_obj.encode(encoding, errors)
+        return json_obj_bytes
+    elif isinstance(json_obj, bytes) and not PYTHON2:
+        # On Python 3, decode bytes to unicode str
+        json_obj_str = json_obj.decode(encoding, errors)
+        log.debug('json2ascii: encode unicode: {0}'.format(json_obj_str))
+        # cannot put original into logger
+        # print 'original: ' json_obj
+        return json_obj_str
     elif isinstance(json_obj, dict):
         for key in json_obj:
             json_obj[key] = json2ascii(json_obj[key])
@@ -1996,20 +2313,19 @@ def json2ascii(json_obj, encoding='utf8', errors='replace'):
     return json_obj
 
 
-_have_printed_json_start = False
-
-def print_json(json_dict=None, _json_is_last=False, **json_parts):
+def print_json(json_dict=None, _json_is_first=False, _json_is_last=False,
+               **json_parts):
     """ line-wise print of json.dumps(json2ascii(..)) with options and indent+1
 
     can use in two ways:
     (1) print_json(some_dict)
     (2) print_json(key1=value1, key2=value2, ...)
 
+    :param bool _json_is_first: set to True only for very first entry to complete
+                                the top-level json-list
     :param bool _json_is_last: set to True only for very last entry to complete
                                the top-level json-list
     """
-    global _have_printed_json_start
-
     if json_dict and json_parts:
         raise ValueError('Invalid json argument: want either single dict or '
                          'key=value parts but got both)')
@@ -2020,9 +2336,8 @@ def print_json(json_dict=None, _json_is_last=False, **json_parts):
     if json_parts:
         json_dict = json_parts
 
-    if not _have_printed_json_start:
+    if _json_is_first:
         print('[')
-        _have_printed_json_start = True
 
     lines = json.dumps(json2ascii(json_dict), check_circular=False,
                            indent=4, ensure_ascii=False).splitlines()
@@ -2091,7 +2406,7 @@ class VBA_Scanner(object):
                 # StrReverse after hex decoding:
                 self.code_hex_rev += '\n' + decoded[::-1]
                 # StrReverse before hex decoding:
-                self.code_rev_hex += '\n' + binascii.unhexlify(encoded[::-1])
+                self.code_rev_hex += '\n' + bytes2str(binascii.unhexlify(encoded[::-1]))
                 #example: https://malwr.com/analysis/NmFlMGI4YTY1YzYyNDkwNTg1ZTBiZmY5OGI3YjlhYzU/
         #TODO: also append the full code reversed if StrReverse? (risk of false positives?)
         # Detect Base64-encoded strings
@@ -2201,7 +2516,7 @@ def scan_vba(vba_code, include_decoded_strings, deobfuscate=False):
     :param include_decoded_strings: bool, if True all encoded strings will be included with their decoded content.
     :param deobfuscate: bool, if True attempt to deobfuscate VBA expressions (slow)
     :return: list of tuples (type, keyword, description)
-    (type = 'AutoExec', 'Suspicious', 'IOC', 'Hex String', 'Base64 String' or 'Dridex String')
+        with type = 'AutoExec', 'Suspicious', 'IOC', 'Hex String', 'Base64 String' or 'Dridex String'
     """
     return VBA_Scanner(vba_code).scan(include_decoded_strings, deobfuscate)
 
@@ -2211,44 +2526,38 @@ def scan_vba(vba_code, include_decoded_strings, deobfuscate=False):
 class VBA_Parser(object):
     """
     Class to parse MS Office files, to detect VBA macros and extract VBA source code
-    Supported file formats:
-    - Word 97-2003 (.doc, .dot)
-    - Word 2007+ (.docm, .dotm)
-    - Word 2003 XML (.xml)
-    - Word MHT - Single File Web Page / MHTML (.mht)
-    - Excel 97-2003 (.xls)
-    - Excel 2007+ (.xlsm, .xlsb)
-    - PowerPoint 97-2003 (.ppt)
-    - PowerPoint 2007+ (.pptm, .ppsm)
     """
 
-    def __init__(self, filename, data=None, container=None, relaxed=False):
+    def __init__(self, filename, data=None, container=None, relaxed=False, encoding=DEFAULT_API_ENCODING):
         """
         Constructor for VBA_Parser
 
-        :param filename: filename or path of file to parse, or file-like object
+        :param str filename: filename or path of file to parse, or file-like object
 
-        :param data: None or bytes str, if None the file will be read from disk (or from the file-like object).
-        If data is provided as a bytes string, it will be parsed as the content of the file in memory,
-        and not read from disk. Note: files must be read in binary mode, i.e. open(f, 'rb').
+        :param bytes data: None or bytes str, if None the file will be read from disk (or from the file-like object).
+            If data is provided as a bytes string, it will be parsed as the content of the file in memory,
+            and not read from disk. Note: files must be read in binary mode, i.e. open(f, 'rb').
 
-        :param container: str, path and filename of container if the file is within
-        a zip archive, None otherwise.
+        :param str container: str, path and filename of container if the file is within
+            a zip archive, None otherwise.
 
-        :param relaxed: if True, treat mal-formed documents and missing streams more like MS office:
-                        do nothing; if False (default), raise errors in these cases
+        :param bool relaxed: if True, treat mal-formed documents and missing streams more like MS office:
+            do nothing; if False (default), raise errors in these cases
 
-        raises a FileOpenError if all attemps to interpret the data header failed
+        :param str encoding: encoding for VBA source code and strings.
+            Default: UTF-8 bytes strings on Python 2, unicode strings on Python 3 (None)
+
+        raises a FileOpenError if all attempts to interpret the data header failed.
         """
-        #TODO: filename should only be a string, data should be used for the file-like object
-        #TODO: filename should be mandatory, optional data is a string or file-like object
-        #TODO: also support olefile and zipfile as input
+        # TODO: filename should only be a string, data should be used for the file-like object
+        # TODO: filename should be mandatory, optional data is a string or file-like object
+        # TODO: also support olefile and zipfile as input
         if data is None:
             # open file from disk:
             _file = filename
         else:
             # file already read in memory, make it a file-like object for zipfile:
-            _file = cStringIO.StringIO(data)
+            _file = BytesIO(data)
         #self.file = _file
         self.ole_file = None
         self.ole_subfiles = []
@@ -2273,6 +2582,9 @@ class VBA_Parser(object):
         self.nb_base64strings = 0
         self.nb_dridexstrings = 0
         self.nb_vbastrings = 0
+        #: Encoding for VBA source code and strings returned by all methods
+        self.encoding = encoding
+        self.xlm_macros = []
 
         # if filename is None:
         #     if isinstance(_file, basestring):
@@ -2288,17 +2600,21 @@ class VBA_Parser(object):
 
             # if this worked, try whether it is a ppt file (special ole file)
             self.open_ppt()
-        if self.type is None and is_zipfile(_file):
+        if self.type is None and zipfile.is_zipfile(_file):
             # Zip file, which may be an OpenXML document
             self.open_openxml(_file)
         if self.type is None:
             # read file from disk, check if it is a Word 2003 XML file (WordProcessingML), Excel 2003 XML,
             # or a plain text file containing VBA code
             if data is None:
-                data = open(filename, 'rb').read()
+                with open(filename, 'rb') as file_handle:
+                    data = file_handle.read()
             # check if it is a Word 2003 XML file (WordProcessingML): must contain the namespace
             if b'http://schemas.microsoft.com/office/word/2003/wordml' in data:
                 self.open_word2003xml(data)
+            # check if it is a Word/PowerPoint 2007+ XML file (Flat OPC): must contain the namespace
+            if b'http://schemas.microsoft.com/office/2006/xmlPackage' in data:
+                self.open_flatopc(data)
             # store a lowercase version for the next tests:
             data_lowercase = data.lower()
             # check if it is a MHT file (MIME HTML, Word or Excel saved as "Single File Web Page"):
@@ -2312,6 +2628,13 @@ class VBA_Parser(object):
                 self.open_mht(data)
         #TODO: handle exceptions
         #TODO: Excel 2003 XML
+            # Check whether this is rtf
+            if rtfobj.is_rtf(data, treat_str_as_data=True):
+                # Ignore RTF since it contains no macros and methods in here will not find macros
+                # in embedded objects. run rtfobj and repeat on its output.
+                msg = '%s is RTF, need to run rtfobj.py and find VBA Macros in its output.' % self.filename
+                log.info(msg)
+                raise FileOpenError(msg)
             # Check if this is a plain text VBA or VBScript file:
             # To avoid scanning binary files, we simply check for some control chars:
             if self.type is None and b'\x00' not in data:
@@ -2357,10 +2680,12 @@ class VBA_Parser(object):
             #TODO: if the zip file is encrypted, suggest to use the -z option, or try '-z infected' automatically
             # check each file within the zip if it is an OLE file, by reading its magic:
             for subfile in z.namelist():
-                magic = z.open(subfile).read(len(olefile.MAGIC))
+                with z.open(subfile) as file_handle:
+                    magic = file_handle.read(len(olefile.MAGIC))
                 if magic == olefile.MAGIC:
                     log.debug('Opening OLE file %s within zip' % subfile)
-                    ole_data = z.open(subfile).read()
+                    with z.open(subfile) as file_handle:
+                        ole_data = file_handle.read()
                     try:
                         self.ole_subfiles.append(
                             VBA_Parser(filename=subfile, data=ole_data,
@@ -2440,6 +2765,51 @@ class VBA_Parser(object):
             log.info('Failed XML parsing for file %r (%s)' % (self.filename, exc))
             log.debug('Trace:', exc_info=True)
 
+    def open_flatopc(self, data):
+        """
+        Open a Word or PowerPoint 2007+ XML file, aka "Flat OPC"
+        :param data: file contents in a string or bytes
+        :return: nothing
+        """
+        log.info('Opening Flat OPC Word/PowerPoint XML file %s' % self.filename)
+        try:
+            # parse the XML content
+            # TODO: handle XML parsing exceptions
+            et = ET.fromstring(data)
+            # TODO: check root node namespace and tag
+            # find all the pkg:part elements:
+            for pkgpart in et.iter(TAG_PKGPART):
+                fname = pkgpart.get(ATTR_PKG_NAME, 'unknown')
+                content_type = pkgpart.get(ATTR_PKG_CONTENTTYPE, 'unknown')
+                if content_type == CTYPE_VBAPROJECT:
+                    for bindata in pkgpart.iterfind(TAG_PKGBINDATA):
+                        try:
+                            ole_data = binascii.a2b_base64(bindata.text)
+                            self.ole_subfiles.append(
+                                VBA_Parser(filename=fname, data=ole_data,
+                                           relaxed=self.relaxed))
+                        except OlevbaBaseException as exc:
+                            if self.relaxed:
+                                log.info('Error parsing subfile {0}: {1}'
+                                         .format(fname, exc))
+                                log.debug('Trace:', exc_info=True)
+                            else:
+                                raise SubstreamOpenError(self.filename, fname, exc)
+            # set type only if parsing succeeds
+            self.type = TYPE_FlatOPC_XML
+        except OlevbaBaseException as exc:
+            if self.relaxed:
+                log.info('Failed XML parsing for file %r (%s)' % (self.filename, exc))
+                log.debug('Trace:', exc_info=True)
+            else:
+                raise
+        except Exception as exc:
+            # TODO: differentiate exceptions for each parsing stage
+            # (but ET is different libs, no good exception description in API)
+            # found: XMLSyntaxError
+            log.info('Failed XML parsing for file %r (%s)' % (self.filename, exc))
+            log.debug('Trace:', exc_info=True)
+
     def open_mht(self, data):
         """
         Open a MHTML file
@@ -2450,12 +2820,12 @@ class VBA_Parser(object):
         try:
             # parse the MIME content
             # remove any leading whitespace or newline (workaround for issue in email package)
-            stripped_data = data.lstrip('\r\n\t ')
+            stripped_data = data.lstrip(b'\r\n\t ')
             # strip any junk from the beginning of the file
             # (issue #31 fix by Greg C - gdigreg)
             # TODO: improve keywords to avoid false positives
-            mime_offset = stripped_data.find('MIME')
-            content_offset = stripped_data.find('Content')
+            mime_offset = stripped_data.find(b'MIME')
+            content_offset = stripped_data.find(b'Content')
             # if "MIME" is found, and located before "Content":
             if -1 < mime_offset <= content_offset:
                 stripped_data = stripped_data[mime_offset:]
@@ -2464,7 +2834,11 @@ class VBA_Parser(object):
             elif content_offset > -1:
                 stripped_data = stripped_data[content_offset:]
             # TODO: quick and dirty fix: insert a standard line with MIME-Version header?
-            mhtml = email.message_from_string(stripped_data)
+            if PYTHON2:
+                mhtml = email.message_from_string(stripped_data)
+            else:
+                # on Python 3, need to use message_from_bytes instead:
+                mhtml = email.message_from_bytes(stripped_data)
             # find all the attached files:
             for part in mhtml.walk():
                 content_type = part.get_content_type()  # always returns a value
@@ -2477,7 +2851,7 @@ class VBA_Parser(object):
                 # using the ActiveMime/MSO format (zlib-compressed), and Base64 encoded.
                 # decompress the zlib data starting at offset 0x32, which is the OLE container:
                 # check ActiveMime header:
-                if isinstance(part_data, str) and is_mso_file(part_data):
+                if isinstance(part_data, bytes) and is_mso_file(part_data):
                     log.debug('Found ActiveMime header, decompressing MSO container')
                     try:
                         ole_data = mso_file_extract(part_data)
@@ -2522,7 +2896,6 @@ class VBA_Parser(object):
         """
 
         log.info('Check whether OLE file is PPT')
-        ppt_parser.enable_logging()
         try:
             ppt = ppt_parser.PptParser(self.ole_file, fast_fail=True)
             for vba_data in ppt.iter_vba_data():
@@ -2548,7 +2921,9 @@ class VBA_Parser(object):
         """
         log.info('Opening text file %s' % self.filename)
         # directly store the source code:
-        self.vba_code_all_modules = data
+        # On Python 2, store it as a raw bytes string
+        # On Python 3, convert it to unicode assuming it was encoded with UTF-8
+        self.vba_code_all_modules = bytes2str(data)
         self.contains_macros = True
         # set type only if parsing succeeds
         self.type = TYPE_TEXT
@@ -2704,7 +3079,7 @@ class VBA_Parser(object):
                         log.debug('%r...[much more data]...%r' % (data[:100], data[-50:]))
                     else:
                         log.debug(repr(data))
-                    if 'Attribut' in data:
+                    if b'Attribut\x00' in data:
                         log.debug('Found VBA compressed code')
                         self.contains_macros = True
                 except IOError as exc:
@@ -2713,7 +3088,43 @@ class VBA_Parser(object):
                         log.debug('Trace:', exc_trace=True)
                     else:
                         raise SubstreamOpenError(self.filename, d.name, exc)
+        if self.detect_xlm_macros():
+            self.contains_macros = True
         return self.contains_macros
+
+    def detect_xlm_macros(self):
+        from oletools.thirdparty.oledump.plugin_biff import cBIFF
+        self.xlm_macros = []
+        if self.ole_file is None:
+            return False
+        for excel_stream in ('Workbook', 'Book'):
+            if self.ole_file.exists(excel_stream):
+                log.debug('Found Excel stream %r' % excel_stream)
+                data = self.ole_file.openstream(excel_stream).read()
+                log.debug('Running BIFF plugin from oledump')
+                try:
+                    biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-x')
+                    self.xlm_macros = biff_plugin.Analyze()
+                    if len(self.xlm_macros)>0:
+                        log.debug('Found XLM macros')
+                        return True
+                except:
+                    log.exception('Error when running oledump.plugin_biff, please report to %s' % URL_OLEVBA_ISSUES)
+        return False
+
+
+    def encode_string(self, unicode_str):
+        """
+        Encode a unicode string to bytes or str, using the specified encoding
+        for the VBA_parser. By default, it will be bytes/UTF-8 on Python 2, and
+        a normal unicode string on Python 3.
+        :param str unicode_str: string to be encoded
+        :return: encoded string
+        """
+        if self.encoding is None:
+            return unicode_str
+        else:
+            return unicode_str.encode(self.encoding, errors='replace')
 
     def extract_macros(self):
         """
@@ -2771,18 +3182,24 @@ class VBA_Parser(object):
                     # read data
                     log.debug('Reading data from stream %r' % d.name)
                     data = ole._open(d.isectStart, d.size).read()
-                    for match in re.finditer(r'\x00Attribut[^e]', data, flags=re.IGNORECASE):
+                    for match in re.finditer(b'\\x00Attribut[^e]', data, flags=re.IGNORECASE):
                         start = match.start() - 3
                         log.debug('Found VBA compressed code at index %X' % start)
                         compressed_code = data[start:]
                         try:
-                            vba_code = decompress_stream(compressed_code)
+                            vba_code = decompress_stream(bytearray(compressed_code))
+                            # TODO vba_code = self.encode_string(vba_code)
                             yield (self.filename, d.name, d.name, vba_code)
                         except Exception as exc:
                             # display the exception with full stack trace for debugging
                             log.debug('Error processing stream %r in file %r (%s)' % (d.name, self.filename, exc))
                             log.debug('Traceback:', exc_info=True)
                             # do not raise the error, as it is unlikely to be a compressed macro stream
+            if self.xlm_macros:
+                vba_code = ''
+                for line in self.xlm_macros:
+                    vba_code += "' " + line + '\n'
+                yield ('xlm_macro', 'xlm_macro', 'xlm_macro.txt', vba_code)
 
     def extract_all_macros(self):
         """
@@ -2804,6 +3221,8 @@ class VBA_Parser(object):
         """
         runs extract_macros and analyze the source code of all VBA macros
         found in the file.
+        All results are stored in self.analysis_results.
+        If called more than once, simply returns the previous results.
         """
         if self.detect_vba_macros():
             # if the analysis was already done, avoid doing it twice:
@@ -2931,11 +3350,12 @@ class VBA_Parser(object):
         """
         Extract printable strings from each VBA Form found in the file
 
-        Iterator: yields (filename, stream_path, vba_filename, vba_code) for each VBA macro found
+        Iterator: yields (filename, stream_path, form_string) for each printable string found in forms
         If the file is OLE, filename is the path of the file.
         If the file is OpenXML, filename is the path of the OLE subfile containing VBA macros
         within the zip archive, e.g. word/vbaProject.bin.
         If the file is PPT, result is as for OpenXML but filename is useless
+        Note: form_string is a raw bytes string on Python 2, a unicode str on Python 3
         """
         if self.ole_file is None:
             # This may be either an OpenXML/PPT or a text file:
@@ -2958,8 +3378,32 @@ class VBA_Parser(object):
                 # Extract printable strings from the form object stream "o":
                 for m in re_printable_string.finditer(form_data):
                     log.debug('Printable string found in form: %r' % m.group())
-                    yield (self.filename, '/'.join(o_stream), m.group())
+                    # On Python 3, convert bytes string to unicode str:
+                    if PYTHON2:
+                        found_str = m.group()
+                    else:
+                        found_str = m.group().decode('utf8', errors='replace')
+                    if found_str != 'Tahoma':
+                        yield (self.filename, '/'.join(o_stream), found_str)
 
+    def extract_form_strings_extended(self):
+        if self.ole_file is None:
+            # This may be either an OpenXML/PPT or a text file:
+            if self.type == TYPE_TEXT:
+                # This is a text file, return no results:
+                return
+            else:
+                # OpenXML/PPT: recursively yield results from each OLE subfile:
+                for ole_subfile in self.ole_subfiles:
+                    for results in ole_subfile.extract_form_strings_extended():
+                        yield results
+        else:
+            # This is an OLE file:
+            self.find_vba_forms()
+            ole = self.ole_file
+            for form_storage in self.vba_forms:
+                for variable in oleform.extract_OleFormVariables(ole, form_storage):
+                    yield (self.filename, '/'.join(form_storage), variable)
 
     def close(self):
         """
@@ -2989,11 +3433,11 @@ class VBA_Parser_CLI(VBA_Parser):
         super(VBA_Parser_CLI, self).__init__(*args, **kwargs)
 
 
-    def print_analysis(self, show_decoded_strings=False, deobfuscate=False):
+    def run_analysis(self, show_decoded_strings=False, deobfuscate=False):
         """
-        Analyze the provided VBA code, and print the results in a table
+        Analyze the provided VBA code, without printing the results (yet)
+        All results are stored in self.analysis_results.
 
-        :param vba_code: str, VBA source code to be analyzed
         :param show_decoded_strings: bool, if True hex-encoded strings will be displayed with their decoded content.
         :param deobfuscate: bool, if True attempt to deobfuscate VBA expressions (slow)
         :return: None
@@ -3002,21 +3446,35 @@ class VBA_Parser_CLI(VBA_Parser):
         if sys.stdout.isatty():
             print('Analysis...\r', end='')
             sys.stdout.flush()
-        results = self.analyze_macros(show_decoded_strings, deobfuscate)
+        self.analyze_macros(show_decoded_strings, deobfuscate)
+
+
+    def print_analysis(self, show_decoded_strings=False, deobfuscate=False):
+        """
+        print the analysis results in a table
+
+        :param show_decoded_strings: bool, if True hex-encoded strings will be displayed with their decoded content.
+        :param deobfuscate: bool, if True attempt to deobfuscate VBA expressions (slow)
+        :return: None
+        """
+        results = self.analysis_results
         if results:
-            t = prettytable.PrettyTable(('Type', 'Keyword', 'Description'))
-            t.align = 'l'
-            t.max_width['Type'] = 10
-            t.max_width['Keyword'] = 20
-            t.max_width['Description'] = 39
+            t = tablestream.TableStream(column_width=(10, 20, 45),
+                                        header_row=('Type', 'Keyword', 'Description'))
+            COLOR_TYPE = {
+                'AutoExec': 'yellow',
+                'Suspicious': 'red',
+                'IOC': 'cyan',
+            }
             for kw_type, keyword, description in results:
                 # handle non printable strings:
                 if not is_printable(keyword):
                     keyword = repr(keyword)
                 if not is_printable(description):
                     description = repr(description)
-                t.add_row((kw_type, keyword, description))
-            print(t)
+                color_type = COLOR_TYPE.get(kw_type, None)
+                t.write_row((kw_type, keyword, description), colors=(color_type, None, None))
+            t.close()
         else:
             print('No suspicious keyword or IOC found.')
 
@@ -3036,6 +3494,25 @@ class VBA_Parser_CLI(VBA_Parser):
             sys.stdout.flush()
         return [dict(type=kw_type, keyword=keyword, description=description)
                 for kw_type, keyword, description in self.analyze_macros(show_decoded_strings, deobfuscate)]
+
+    def colorize_keywords(self, vba_code):
+        """
+        Colorize keywords found during the VBA code analysis
+        :param vba_code: str, VBA code to be colorized
+        :return: str, VBA code including color tags for Colorclass
+        """
+        results = self.analysis_results
+        if results:
+            COLOR_TYPE = {
+                'AutoExec': 'yellow',
+                'Suspicious': 'red',
+                'IOC': 'cyan',
+            }
+            for kw_type, keyword, description in results:
+                color_type = COLOR_TYPE.get(kw_type, None)
+                if color_type:
+                    vba_code = vba_code.replace(keyword, '{auto%s}%s{/%s}' % (color_type, keyword, color_type))
+        return vba_code
 
     def process_file(self, show_decoded_strings=False,
                      display_code=True, hide_attributes=True,
@@ -3067,6 +3544,8 @@ class VBA_Parser_CLI(VBA_Parser):
             #TODO: handle olefile errors, when an OLE file is malformed
             print('Type: %s'% self.type)
             if self.detect_vba_macros():
+                # run analysis before displaying VBA code, in order to colorize found keywords
+                self.run_analysis(show_decoded_strings=show_decoded_strings, deobfuscate=deobfuscate)
                 #print 'Contains VBA Macros:'
                 for (subfilename, stream_path, vba_filename, vba_code) in self.extract_all_macros():
                     if hide_attributes:
@@ -3083,12 +3562,43 @@ class VBA_Parser_CLI(VBA_Parser):
                         if vba_code_filtered.strip() == '':
                             print('(empty macro)')
                         else:
+                            # check if the VBA code contains special characters such as backspace (issue #358)
+                            if '\x08' in vba_code_filtered:
+                                log.warning('The VBA code contains special characters such as backspace, that may be used for obfuscation.')
+                                if sys.stdout.isatty():
+                                    # if the standard output is the console, we'll display colors
+                                    backspace = colorclass.Color(b'{autored}\\x08{/red}')
+                                else:
+                                    backspace = '\\x08'
+                                # replace backspace by "\x08" for display
+                                vba_code_filtered = vba_code_filtered.replace('\x08', backspace)
+                            try:
+                                # Colorize the interesting keywords in the output:
+                                # (unless the output is redirected to a file)
+                                if sys.stdout.isatty():
+                                    vba_code_filtered = colorclass.Color(self.colorize_keywords(vba_code_filtered))
+                            except UnicodeError:
+                                # TODO better handling of Unicode
+                                log.error('Unicode conversion to be fixed before colorizing the output')
                             print(vba_code_filtered)
                 for (subfilename, stream_path, form_string) in self.extract_form_strings():
-                    print('-' * 79)
-                    print('VBA FORM STRING IN %r - OLE stream: %r' % (subfilename, stream_path))
-                    print('- ' * 39)
-                    print(form_string)
+                    if form_string is not None:
+                        print('-' * 79)
+                        print('VBA FORM STRING IN %r - OLE stream: %r' % (subfilename, stream_path))
+                        print('- ' * 39)
+                        print(form_string)
+                try:
+                    for (subfilename, stream_path, form_variables) in self.extract_form_strings_extended():
+                        if form_variables is not None:
+                            print('-' * 79)
+                            print('VBA FORM Variable "%s" IN %r - OLE stream: %r' % (form_variables['name'], subfilename, stream_path))
+                            print('- ' * 39)
+                            print(str(form_variables['value']))
+                except Exception as exc:
+                    # display the exception with full stack trace for debugging
+                    log.info('Error parsing form: %s' % exc)
+                    log.debug('Traceback:', exc_info=True)
+
                 if not vba_code_only:
                     # analyse the code from all modules at once:
                     self.print_analysis(show_decoded_strings, deobfuscate)
@@ -3209,16 +3719,6 @@ class VBA_Parser_CLI(VBA_Parser):
 
             line = '%-12s %s' % (flags, self.filename)
             print(line)
-
-            # old table display:
-            # macros = autoexec = suspicious = iocs = hexstrings = 'no'
-            # if nb_macros: macros = 'YES:%d' % nb_macros
-            # if nb_autoexec: autoexec = 'YES:%d' % nb_autoexec
-            # if nb_suspicious: suspicious = 'YES:%d' % nb_suspicious
-            # if nb_iocs: iocs = 'YES:%d' % nb_iocs
-            # if nb_hexstrings: hexstrings = 'YES:%d' % nb_hexstrings
-            # # 2nd line = info
-            # print '%-8s %-7s %-7s %-7s %-7s %-7s' % (self.type, macros, autoexec, suspicious, iocs, hexstrings)
         except Exception as exc:
             # display the exception with full stack trace for debugging only
             log.debug('Error processing file %s (%s)' % (self.filename, exc),
@@ -3226,26 +3726,11 @@ class VBA_Parser_CLI(VBA_Parser):
             raise ProcessingError(self.filename, exc)
 
 
-        # t = prettytable.PrettyTable(('filename', 'type', 'macros', 'autoexec', 'suspicious', 'ioc', 'hexstrings'),
-        #     header=False, border=False)
-        # t.align = 'l'
-        # t.max_width['filename'] = 30
-        # t.max_width['type'] = 10
-        # t.max_width['macros'] = 6
-        # t.max_width['autoexec'] = 6
-        # t.max_width['suspicious'] = 6
-        # t.max_width['ioc'] = 6
-        # t.max_width['hexstrings'] = 6
-        # t.add_row((filename, ftype, macros, autoexec, suspicious, iocs, hexstrings))
-        # print t
-
-
 #=== MAIN =====================================================================
 
-def main():
-    """
-    Main function, called when olevba is run from the command line
-    """
+def parse_args(cmd_line_args=None):
+    """ parse command line arguments (given ones or per default sys.argv) """
+
     DEFAULT_LOG_LEVEL = "warning" # Default log level
     LOG_LEVELS = {
         'debug':    logging.DEBUG,
@@ -3264,7 +3749,11 @@ def main():
     parser.add_option("-r", action="store_true", dest="recursive",
                       help='find files recursively in subdirectories.')
     parser.add_option("-z", "--zip", dest='zip_password', type='str', default=None,
-                      help='if the file is a zip archive, open all files from it, using the provided password (requires Python 2.6+)')
+                      help='if the file is a zip archive, open all files from it, using the provided password.')
+    parser.add_option("-p", "--password", type='str', action='append',
+                      default=[],
+                      help='if encrypted office files are encountered, try '
+                           'decryption with this password. May be repeated.')
     parser.add_option("-f", "--zipfname", dest='zip_fname', type='str', default='*',
                       help='if the file is a zip archive, file(s) to be opened within the zip. Wildcards * and ? are supported. (default:*)')
     # output mode; could make this even simpler with add_option(type='choice') but that would make
@@ -3297,31 +3786,150 @@ def main():
     parser.add_option('--relaxed', dest="relaxed", action="store_true", default=False,
                             help="Do not raise errors if opening of substream fails")
 
-    (options, args) = parser.parse_args()
+    (options, args) = parser.parse_args(cmd_line_args)
 
     # Print help if no arguments are passed
     if len(args) == 0:
-        print('olevba %s - http://decalage.info/python/oletools' % __version__)
+        # print banner with version
+        python_version = '%d.%d.%d' % sys.version_info[0:3]
+        print('olevba %s on Python %s - http://decalage.info/python/oletools' %
+              (__version__, python_version))
         print(__doc__)
         parser.print_help()
         sys.exit(RETURN_WRONG_ARGS)
 
+    options.loglevel = LOG_LEVELS[options.loglevel]
+
+    return options, args
+
+
+def process_file(filename, data, container, options, crypto_nesting=0):
+    """
+    Part of main function that processes a single file.
+
+    This handles exceptions and encryption.
+
+    Returns a single code summarizing the status of processing of this file
+    """
+    try:
+        # Open the file
+        vba_parser = VBA_Parser_CLI(filename, data=data, container=container,
+                                    relaxed=options.relaxed)
+
+        if options.output_mode == 'detailed':
+            # fully detailed output
+            vba_parser.process_file(show_decoded_strings=options.show_decoded_strings,
+                         display_code=options.display_code,
+                         hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
+                         show_deobfuscated_code=options.show_deobfuscated_code,
+                         deobfuscate=options.deobfuscate)
+        elif options.output_mode == 'triage':
+            # summarized output for triage:
+            vba_parser.process_file_triage(show_decoded_strings=options.show_decoded_strings,
+                                           deobfuscate=options.deobfuscate)
+        elif options.output_mode == 'json':
+            print_json(
+                vba_parser.process_file_json(show_decoded_strings=options.show_decoded_strings,
+                         display_code=options.display_code,
+                         hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
+                         show_deobfuscated_code=options.show_deobfuscated_code,
+                         deobfuscate=options.deobfuscate))
+        else:  # (should be impossible)
+            raise ValueError('unexpected output mode: "{0}"!'.format(options.output_mode))
+
+        # even if processing succeeds, file might still be encrypted
+        log.debug('Checking for encryption (normal)')
+        if not crypto.is_encrypted(filename):
+            log.debug('no encryption detected')
+            return RETURN_OK
+    except Exception as exc:
+        log.debug('Checking for encryption (after exception)')
+        if crypto.is_encrypted(filename):
+            pass   # deal with this below
+        else:
+            if isinstance(exc, (SubstreamOpenError, UnexpectedDataError)):
+                if options.output_mode in ('triage', 'unspecified'):
+                    print('%-12s %s - Error opening substream or uenxpected ' \
+                          'content' % ('?', filename))
+                elif options.output_mode == 'json':
+                    print_json(file=filename, type='error',
+                               error=type(exc).__name__, message=str(exc))
+                else:
+                    log.exception('Error opening substream or unexpected '
+                                  'content in %s' % filename)
+                return RETURN_OPEN_ERROR
+            elif isinstance(exc, FileOpenError):
+                if options.output_mode in ('triage', 'unspecified'):
+                    print('%-12s %s - File format not supported' % ('?', filename))
+                elif options.output_mode == 'json':
+                    print_json(file=filename, type='error',
+                               error=type(exc).__name__, message=str(exc))
+                else:
+                    log.exception('Failed to open %s -- probably not supported!' % filename)
+                return RETURN_OPEN_ERROR
+            elif isinstance(exc, ProcessingError):
+                if options.output_mode in ('triage', 'unspecified'):
+                    print('%-12s %s - %s' % ('!ERROR', filename, exc.orig_exc))
+                elif options.output_mode == 'json':
+                    print_json(file=filename, type='error',
+                               error=type(exc).__name__,
+                               message=str(exc.orig_exc))
+                else:
+                    log.exception('Error processing file %s (%s)!'
+                                  % (filename, exc.orig_exc))
+                return RETURN_PARSE_ERROR
+            else:
+                raise    # let caller deal with this
+
+    # we reach this point only if file is encrypted
+    # check if this is an encrypted file in an encrypted file in an ...
+    if crypto_nesting >= crypto.MAX_NESTING_DEPTH:
+        raise crypto.MaxCryptoNestingReached(crypto_nesting, filename)
+
+    decrypted_file = None
+    try:
+        log.debug('Checking encryption passwords {}'.format(options.password))
+        passwords = options.password + \
+            [crypto.WRITE_PROTECT_ENCRYPTION_PASSWORD, ]
+        decrypted_file = crypto.decrypt(filename, passwords)
+        if not decrypted_file:
+            raise crypto.WrongEncryptionPassword(filename)
+        log.info('Working on decrypted file')
+        return process_file(decrypted_file, data, container or filename,
+                            options, crypto_nesting+1)
+    except Exception:
+        raise
+    finally:     # clean up
+        if decrypted_file is not None and os.path.isfile(decrypted_file):
+            os.unlink(decrypted_file)
+
+
+def main(cmd_line_args=None):
+    """
+    Main function, called when olevba is run from the command line
+
+    Optional argument: command line arguments to be forwarded to ArgumentParser
+    in process_args. Per default (cmd_line_args=None), sys.argv is used. Option
+    mainly added for unit-testing
+    """
+
+    options, args = parse_args(cmd_line_args)
+
     # provide info about tool and its version
     if options.output_mode == 'json':
-        # prints opening [
+        # print first json entry with meta info and opening '['
         print_json(script_name='olevba', version=__version__,
                    url='http://decalage.info/python/oletools',
-                   type='MetaInformation')
+                   type='MetaInformation', _json_is_first=True)
     else:
-        print('olevba %s - http://decalage.info/python/oletools' % __version__)
+        # print banner with version
+        python_version = '%d.%d.%d' % sys.version_info[0:3]
+        print('olevba %s on Python %s - http://decalage.info/python/oletools' %
+              (__version__, python_version))
 
-    logging.basicConfig(level=LOG_LEVELS[options.loglevel], format='%(levelname)-8s %(message)s')
+    logging.basicConfig(level=options.loglevel, format='%(levelname)-8s %(message)s')
     # enable logging in the modules:
-    log.setLevel(logging.NOTSET)
-
-    # Old display with number of items detected:
-    # print '%-8s %-7s %-7s %-7s %-7s %-7s' % ('Type', 'Macros', 'AutoEx', 'Susp.', 'IOCs', 'HexStr')
-    # print '%-8s %-7s %-7s %-7s %-7s %-7s' % ('-'*8, '-'*7, '-'*7, '-'*7, '-'*7, '-'*7)
+    enable_logging()
 
     # with the option --reveal, make sure --deobf is also enabled:
     if options.show_deobfuscated_code and not options.deobfuscate:
@@ -3330,35 +3938,44 @@ def main():
     if options.output_mode == 'triage' and options.show_deobfuscated_code:
         log.info('ignoring option --reveal in triage output mode')
 
-    # Column headers (do not know how many files there will be yet, so if no output_mode
-    # was specified, we will print triage for first file --> need these headers)
-    if options.output_mode in ('triage', 'unspecified'):
+    # gather info on all files that must be processed
+    # ignore directory names stored in zip files:
+    all_input_info = tuple((container, filename, data) for
+                           container, filename, data in xglob.iter_files(
+                               args, recursive=options.recursive,
+                               zip_password=options.zip_password,
+                               zip_fname=options.zip_fname)
+                           if not (container and filename.endswith('/')))
+
+    # specify output mode if options -t, -d and -j were not specified
+    if options.output_mode == 'unspecified':
+        if len(all_input_info) == 1:
+            options.output_mode = 'detailed'
+        else:
+            options.output_mode = 'triage'
+
+    # Column headers for triage mode
+    if options.output_mode == 'triage':
         print('%-12s %-65s' % ('Flags', 'Filename'))
         print('%-12s %-65s' % ('-' * 11, '-' * 65))
 
     previous_container = None
     count = 0
     container = filename = data = None
-    vba_parser = None
     return_code = RETURN_OK
     try:
-        for container, filename, data in xglob.iter_files(args, recursive=options.recursive,
-                                                          zip_password=options.zip_password, zip_fname=options.zip_fname):
-            # ignore directory names stored in zip files:
-            if container and filename.endswith('/'):
-                continue
-
+        for container, filename, data in all_input_info:
             # handle errors from xglob
             if isinstance(data, Exception):
                 if isinstance(data, PathNotFoundException):
-                    if options.output_mode in ('triage', 'unspecified'):
+                    if options.output_mode == 'triage':
                         print('%-12s %s - File not found' % ('?', filename))
                     elif options.output_mode != 'json':
                         log.error('Given path %r does not exist!' % filename)
                     return_code = RETURN_FILE_NOT_FOUND if return_code == 0 \
                                                     else RETURN_SEVERAL_ERRS
                 else:
-                    if options.output_mode in ('triage', 'unspecified'):
+                    if options.output_mode == 'triage':
                         print('%-12s %s - Failed to read from zip file %s' % ('?', filename, container))
                     elif options.output_mode != 'json':
                         log.error('Exception opening/reading %r from zip file %r: %s'
@@ -3370,94 +3987,42 @@ def main():
                                error=type(data).__name__, message=str(data))
                 continue
 
-            try:
-                # Open the file
-                vba_parser = VBA_Parser_CLI(filename, data=data, container=container,
-                                            relaxed=options.relaxed)
+            if options.output_mode == 'triage':
+                # print container name when it changes:
+                if container != previous_container:
+                    if container is not None:
+                        print('\nFiles in %s:' % container)
+                    previous_container = container
 
-                if options.output_mode == 'detailed':
-                    # fully detailed output
-                    vba_parser.process_file(show_decoded_strings=options.show_decoded_strings,
-                                 display_code=options.display_code,
-                                 hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
-                                 show_deobfuscated_code=options.show_deobfuscated_code,
-                                 deobfuscate=options.deobfuscate)
-                elif options.output_mode in ('triage', 'unspecified'):
-                    # print container name when it changes:
-                    if container != previous_container:
-                        if container is not None:
-                            print('\nFiles in %s:' % container)
-                        previous_container = container
-                    # summarized output for triage:
-                    vba_parser.process_file_triage(show_decoded_strings=options.show_decoded_strings,
-                                                   deobfuscate=options.deobfuscate)
-                elif options.output_mode == 'json':
-                    print_json(
-                        vba_parser.process_file_json(show_decoded_strings=options.show_decoded_strings,
-                                 display_code=options.display_code,
-                                 hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
-                                 show_deobfuscated_code=options.show_deobfuscated_code,
-                                 deobfuscate=options.deobfuscate))
-                else:  # (should be impossible)
-                    raise ValueError('unexpected output mode: "{0}"!'.format(options.output_mode))
-                count += 1
+            # process the file, handling errors and encryption
+            curr_return_code = process_file(filename, data, container, options)
+            count += 1
 
-            except (SubstreamOpenError, UnexpectedDataError) as exc:
-                if options.output_mode in ('triage', 'unspecified'):
-                    print('%-12s %s - Error opening substream or uenxpected ' \
-                          'content' % ('?', filename))
-                elif options.output_mode == 'json':
-                    print_json(file=filename, type='error',
-                               error=type(exc).__name__, message=str(exc))
-                else:
-                    log.exception('Error opening substream or unexpected '
-                                  'content in %s' % filename)
-                return_code = RETURN_OPEN_ERROR if return_code == 0 \
-                                                else RETURN_SEVERAL_ERRS
-            except FileOpenError as exc:
-                if options.output_mode in ('triage', 'unspecified'):
-                    print('%-12s %s - File format not supported' % ('?', filename))
-                elif options.output_mode == 'json':
-                    print_json(file=filename, type='error',
-                               error=type(exc).__name__, message=str(exc))
-                else:
-                    log.exception('Failed to open %s -- probably not supported!' % filename)
-                return_code = RETURN_OPEN_ERROR if return_code == 0 \
-                                                else RETURN_SEVERAL_ERRS
-            except ProcessingError as exc:
-                if options.output_mode in ('triage', 'unspecified'):
-                    print('%-12s %s - %s' % ('!ERROR', filename, exc.orig_exc))
-                elif options.output_mode == 'json':
-                    print_json(file=filename, type='error',
-                               error=type(exc).__name__,
-                               message=str(exc.orig_exc))
-                else:
-                    log.exception('Error processing file %s (%s)!'
-                                  % (filename, exc.orig_exc))
-                return_code = RETURN_PARSE_ERROR if return_code == 0 \
-                                                else RETURN_SEVERAL_ERRS
-            finally:
-                if vba_parser is not None:
-                    vba_parser.close()
+            # adjust overall return code
+            if curr_return_code == RETURN_OK:
+                continue                    # do not modify overall return code
+            if return_code == RETURN_OK:
+                return_code = curr_return_code      # first error return code
+            else:
+                return_code = RETURN_SEVERAL_ERRS   # several errors
 
         if options.output_mode == 'triage':
-            print('\n(Flags: OpX=OpenXML, XML=Word2003XML, MHT=MHTML, TXT=Text, M=Macros, ' \
+            print('\n(Flags: OpX=OpenXML, XML=Word2003XML, FlX=FlatOPC XML, MHT=MHTML, TXT=Text, M=Macros, ' \
                   'A=Auto-executable, S=Suspicious keywords, I=IOCs, H=Hex strings, ' \
                   'B=Base64 strings, D=Dridex strings, V=VBA strings, ?=Unknown)\n')
-
-        if count == 1 and options.output_mode == 'unspecified':
-            # if options -t, -d and -j were not specified and it's a single file, print details:
-            vba_parser.process_file(show_decoded_strings=options.show_decoded_strings,
-                             display_code=options.display_code,
-                             hide_attributes=options.hide_attributes, vba_code_only=options.vba_code_only,
-                             show_deobfuscated_code=options.show_deobfuscated_code,
-                             deobfuscate=options.deobfuscate)
 
         if options.output_mode == 'json':
             # print last json entry (a last one without a comma) and closing ]
             print_json(type='MetaInformation', return_code=return_code,
                        n_processed=count, _json_is_last=True)
 
+    except crypto.CryptoErrorBase as exc:
+        log.exception('Problems with encryption in main: {}'.format(exc),
+                      exc_info=True)
+        if return_code == RETURN_OK:
+            return_code = RETURN_ENCRYPTED
+        else:
+            return_code == RETURN_SEVERAL_ERRS
     except Exception as exc:
         # some unexpected error, maybe some of the types caught in except clauses
         # above were not sufficient. This is very bad, so log complete trace at exception level

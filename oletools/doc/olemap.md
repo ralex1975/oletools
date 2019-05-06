@@ -10,7 +10,7 @@ It is part of the [python-oletools](http://www.decalage.info/python/oletools) pa
 ## Usage
 
 ```text
-Usage: olemap.py <filename>
+Usage: olemap <filename>
 ```
 
 ### Examples
@@ -18,7 +18,7 @@ Usage: olemap.py <filename>
 Scan a single file:
 
 ```text
-olemap.py file.doc
+olemap file.doc
 ```
     
 ![](olemap1.png)
@@ -41,14 +41,15 @@ python-oletools documentation
 - [[Install]]
 - [[Contribute]], Suggest Improvements or Report Issues
 - Tools:
-	- [[olebrowse]]
-	- [[oleid]]
-	- [[olemeta]]
-	- [[oletimes]]
-	- [[oledir]]
-	- [[olemap]]
-	- [[olevba]]
 	- [[mraptor]]
-	- [[pyxswf]]
+	- [[msodde]]
+	- [[olebrowse]]
+	- [[oledir]]
+	- [[oleid]]
+	- [[olemap]]
+	- [[olemeta]]
 	- [[oleobj]]
+	- [[oletimes]]
+	- [[olevba]]
+	- [[pyxswf]]
 	- [[rtfobj]]

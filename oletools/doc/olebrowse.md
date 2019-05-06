@@ -30,9 +30,9 @@ sudo apt-get install python3-tk
 
 Usage
 -----
-
-	olebrowse.py [file]
-
+```
+olebrowse [file]
+```
 If you provide a file it will be opened, else a dialog will allow you to browse
 folders to open a file. Then if it is a valid OLE file, the list of data streams
 will be displayed. You can select a stream, and then either view its content
@@ -63,14 +63,15 @@ python-oletools documentation
 - [[Install]]
 - [[Contribute]], Suggest Improvements or Report Issues
 - Tools:
-	- [[olebrowse]]
-	- [[oleid]]
-	- [[olemeta]]
-	- [[oletimes]]
-	- [[oledir]]
-	- [[olemap]]
-	- [[olevba]]
 	- [[mraptor]]
-	- [[pyxswf]]
+	- [[msodde]]
+	- [[olebrowse]]
+	- [[oledir]]
+	- [[oleid]]
+	- [[olemap]]
+	- [[olemeta]]
 	- [[oleobj]]
+	- [[oletimes]]
+	- [[olevba]]
+	- [[pyxswf]]
 	- [[rtfobj]]
